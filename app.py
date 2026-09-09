@@ -1,12 +1,12 @@
 import os
+import subprocess
 import zipfile
 import streamlit as st
-from moviepy.editor import VideoFileClip, TextClip, CompositeVideoClip
 
 st.title("🎥 Auto Video Splitter & Text Adder")
 st.write(
-    "Upload a long video, and it will split it into 30-second clips with 'Part"
-    " 1, Part 2...' text automatically!"
+    "Upload any long video, and it will split it into 30-second clips with 'Part"
+    " 1, Part 2...' text!"
 )
 
 uploaded_file = st.file_uploader(
@@ -23,61 +23,83 @@ if uploaded_file is not None:
 
   if st.button("🚀 Process & Split Video"):
     with st.spinner(
-        "Processing video... Please wait (this might take a minute)."
+        "Processing video... Please wait (this can take a minute)."
     ):
       output_dir = "output_clips"
       os.makedirs(output_dir, exist_ok=True)
 
+      # Get video duration safely using ffprobe
+      probe_cmd = [
+          "ffprobe",
+          "-v",
+          "error",
+          "-show_entries",
+          "format=duration",
+          "-of",
+          "default=noprint_wrappers=1:n=1",
+          input_path,
+      ]
+      result = subprocess.run(
+          probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+      )
+
       try:
-        # Load video using MoviePy (No ffprobe error issues)
-        video = VideoFileClip(input_path)
-        total_duration = video.duration
+        total_duration = float(result.stdout.strip())
+      except Exception:
+        # Fallback if ffprobe fails to read duration
+        total_duration = 0
+
+      if total_duration <= 0:
+        st.error(
+            "Could not read video duration. Please make sure the video file is"
+            " valid."
+        )
+      else:
         chunk_duration = 30  # 30 seconds
         clips = []
-
-        start_time = 0
         part_num = 1
+        start_time = 0
 
         while start_time < total_duration:
-          end_time = min(start_time + chunk_duration, total_duration)
-
-          # Cut the subclip
-          subclip = video.subclip(start_time, end_time)
-
-          # Create Text Overlay ("Part 1", "Part 2", etc.)
-          txt_clip = (
-              TextClip(
-                  f"Part {part_num}",
-                  fontsize=50,
-                  color="white",
-                  stroke_color="black",
-                  stroke_width=2,
-              )
-              .set_duration(subclip.duration)
-              .set_position(("center", 50))
-          )  # Positioned at top-center
-
-          # Overlay text on video clip
-          final_clip = CompositeVideoClip([subclip, txt_clip])
-
           output_filename = f"Part_{part_num}.mp4"
           output_filepath = os.path.join(output_dir, output_filename)
 
-          # Write output file
-          final_clip.write_videofile(
+          text_to_draw = f"Part {part_num}"
+
+          # Direct FFmpeg command to cut chunk and add text overlay cleanly
+          # fontSize=48, White text with black border, positioned at top center
+          ffmpeg_cmd = [
+              "ffmpeg",
+              "-y",
+              "-ss",
+              str(start_time),
+              "-i",
+              input_path,
+              "-t",
+              str(chunk_duration),
+              "-vf",
+              (
+                  "drawtext=text='"
+                  + text_to_draw
+                  + "':fontcolor=white:fontsize=48:borderw=3:bordercolor=black:x=(w-text_w)/2:y=50"
+              ),
+              "-c:v",
+              "libx264",
+              "-c:a",
+              "aac",
               output_filepath,
-              codec="libx264",
-              audio_codec="aac",
-              fps=24,
-              preset="fast",
-              logger=None,
+          ]
+
+          subprocess.run(
+              ffmpeg_cmd,
+              stdout=subprocess.PIPE,
+              stderr=subprocess.PIPE,
+              text=True,
           )
 
           clips.append(output_filepath)
           start_time += chunk_duration
           part_num += 1
-
-        video.close()
 
         # Zip all generated clips together
         zip_filename = "all_video_parts.zip"
@@ -98,6 +120,3 @@ if uploaded_file is not None:
               file_name="video_parts.zip",
               mime="application/zip",
           )
-
-      except Exception as e:
-        st.error(f"An error occurred during processing: {e}")
