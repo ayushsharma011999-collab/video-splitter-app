@@ -6,7 +6,7 @@ import streamlit as st
 st.title("🎥 Auto Video Splitter & Text Adder")
 st.write(
     "Upload any long video, and it will split it into 30-second clips with 'Part"
-    " 1, Part 2...' text!"
+    " 1, Part 2...' text automatically!"
 )
 
 uploaded_file = st.file_uploader(
@@ -28,79 +28,59 @@ if uploaded_file is not None:
       output_dir = "output_clips"
       os.makedirs(output_dir, exist_ok=True)
 
-      # Get video duration safely using ffprobe
-      probe_cmd = [
-          "ffprobe",
-          "-v",
-          "error",
-          "-show_entries",
-          "format=duration",
-          "-of",
-          "default=noprint_wrappers=1:n=1",
-          input_path,
-      ]
-      result = subprocess.run(
-          probe_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
-      )
+      chunk_duration = 30  # 30 seconds per clip
+      clips = []
+      part_num = 1
+      start_time = 0
 
-      try:
-        total_duration = float(result.stdout.strip())
-      except Exception:
-        # Fallback if ffprobe fails to read duration
-        total_duration = 0
+      # Infinite loop that cuts clips sequentially until video ends
+      while True:
+        output_filename = f"Part_{part_num}.mp4"
+        output_filepath = os.path.join(output_dir, output_filename)
+        text_to_draw = f"Part {part_num}"
 
-      if total_duration <= 0:
-        st.error(
-            "Could not read video duration. Please make sure the video file is"
-            " valid."
+        # FFmpeg command to cut a 30s segment starting from 'start_time'
+        ffmpeg_cmd = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            str(start_time),
+            "-i",
+            input_path,
+            "-t",
+            str(chunk_duration),
+            "-vf",
+            (
+                "drawtext=text='"
+                + text_to_draw
+                + "':fontcolor=white:fontsize=48:borderw=3:bordercolor=black:x=(w-text_w)/2:y=50"
+            ),
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            output_filepath,
+        ]
+
+        process = subprocess.run(
+            ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
-      else:
-        chunk_duration = 30  # 30 seconds
-        clips = []
-        part_num = 1
-        start_time = 0
 
-        while start_time < total_duration:
-          output_filename = f"Part_{part_num}.mp4"
-          output_filepath = os.path.join(output_dir, output_filename)
+        # Check if the generated clip is empty or failed (meaning video has ended)
+        if (
+            not os.path.exists(output_filepath)
+            or os.path.getsize(output_filepath) < 1000
+        ):
+          # Delete the last empty/failed file if created
+          if os.path.exists(output_filepath):
+            os.remove(output_filepath)
+          break
 
-          text_to_draw = f"Part {part_num}"
+        clips.append(output_filepath)
+        start_time += chunk_duration
+        part_num += 1
 
-          # Direct FFmpeg command to cut chunk and add text overlay cleanly
-          # fontSize=48, White text with black border, positioned at top center
-          ffmpeg_cmd = [
-              "ffmpeg",
-              "-y",
-              "-ss",
-              str(start_time),
-              "-i",
-              input_path,
-              "-t",
-              str(chunk_duration),
-              "-vf",
-              (
-                  "drawtext=text='"
-                  + text_to_draw
-                  + "':fontcolor=white:fontsize=48:borderw=3:bordercolor=black:x=(w-text_w)/2:y=50"
-              ),
-              "-c:v",
-              "libx264",
-              "-c:a",
-              "aac",
-              output_filepath,
-          ]
-
-          subprocess.run(
-              ffmpeg_cmd,
-              stdout=subprocess.PIPE,
-              stderr=subprocess.PIPE,
-              text=True,
-          )
-
-          clips.append(output_filepath)
-          start_time += chunk_duration
-          part_num += 1
-
+      if len(clips) > 0:
         # Zip all generated clips together
         zip_filename = "all_video_parts.zip"
         with zipfile.ZipFile(zip_filename, "w") as zipf:
@@ -120,3 +100,8 @@ if uploaded_file is not None:
               file_name="video_parts.zip",
               mime="application/zip",
           )
+      else:
+        st.error(
+            "Could not process the video. Please try a different video format"
+            " (like .mp4)."
+        )
