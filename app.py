@@ -6,7 +6,7 @@ import streamlit as st
 st.title("🎥 Auto Video Splitter & Text App")
 st.write(
     "Upload a long video. It will split into 30s clips with 'Part 1, Part 2...'"
-    " inside the video, and custom file names!"
+    " at the top-right corner, and custom file names!"
 )
 
 uploaded_file = st.file_uploader(
@@ -40,10 +40,10 @@ if uploaded_file is not None:
         # Text inside video screen: Only Part 1, Part 2, etc.
         text_to_draw = f"Part {part_num}"
 
-        # FFmpeg filter to add text inside the video (Top-Center)
+        # FFmpeg filter: Small font size (24) and positioned at Top-Right Corner (x = width - text_width - 30, y = 30)
         video_filter = (
-            f"drawtext=text='{text_to_draw}':fontcolor=white:fontsize=48:"
-            f"borderw=3:bordercolor=black:x=(w-text_w)/2:y=50"
+            f"drawtext=text='{text_to_draw}':fontcolor=white:fontsize=28:"
+            f"borderw=2:bordercolor=black:x=w-text_w-30:y=30"
         )
 
         ffmpeg_cmd = [
@@ -84,7 +84,6 @@ if uploaded_file is not None:
         zip_filename = "all_video_parts.zip"
         with zipfile.ZipFile(zip_filename, "w") as zipf:
           for clip in clips:
-            # Add file to zip with its proper custom name
             zipf.write(clip, os.path.basename(clip))
 
         st.success(
