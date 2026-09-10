@@ -3,10 +3,10 @@ import subprocess
 import zipfile
 import streamlit as st
 
-st.title("🎥 Auto Video Splitter & Text Adder")
+st.title("🎥 Auto Video Splitter & Text App")
 st.write(
-    "Upload any long video, and it will split it into 30-second clips with 'Part"
-    " 1, Part 2...' text automatically!"
+    "Upload a long video. It will split into 30s clips with 'Part 1, Part 2...'"
+    " inside the video, and custom file names!"
 )
 
 uploaded_file = st.file_uploader(
@@ -14,7 +14,6 @@ uploaded_file = st.file_uploader(
 )
 
 if uploaded_file is not None:
-  # Save uploaded video temporarily
   input_path = "input_video.mp4"
   with open(input_path, "wb") as f:
     f.write(uploaded_file.read())
@@ -33,13 +32,20 @@ if uploaded_file is not None:
       part_num = 1
       start_time = 0
 
-      # Infinite loop that cuts clips sequentially until video ends
       while True:
-        output_filename = f"Part_{part_num}.mp4"
+        # File name format: Follow My Page for More Videos Part_1.mp4
+        output_filename = f"Follow My Page for More Videos Part_{part_num}.mp4"
         output_filepath = os.path.join(output_dir, output_filename)
+
+        # Text inside video screen: Only Part 1, Part 2, etc.
         text_to_draw = f"Part {part_num}"
 
-        # FFmpeg command to cut a 30s segment starting from 'start_time'
+        # FFmpeg filter to add text inside the video (Top-Center)
+        video_filter = (
+            f"drawtext=text='{text_to_draw}':fontcolor=white:fontsize=48:"
+            f"borderw=3:bordercolor=black:x=(w-text_w)/2:y=50"
+        )
+
         ffmpeg_cmd = [
             "ffmpeg",
             "-y",
@@ -50,11 +56,7 @@ if uploaded_file is not None:
             "-t",
             str(chunk_duration),
             "-vf",
-            (
-                "drawtext=text='"
-                + text_to_draw
-                + "':fontcolor=white:fontsize=48:borderw=3:bordercolor=black:x=(w-text_w)/2:y=50"
-            ),
+            video_filter,
             "-c:v",
             "libx264",
             "-c:a",
@@ -66,12 +68,10 @@ if uploaded_file is not None:
             ffmpeg_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
         )
 
-        # Check if the generated clip is empty or failed (meaning video has ended)
         if (
             not os.path.exists(output_filepath)
             or os.path.getsize(output_filepath) < 1000
         ):
-          # Delete the last empty/failed file if created
           if os.path.exists(output_filepath):
             os.remove(output_filepath)
           break
@@ -81,27 +81,25 @@ if uploaded_file is not None:
         part_num += 1
 
       if len(clips) > 0:
-        # Zip all generated clips together
         zip_filename = "all_video_parts.zip"
         with zipfile.ZipFile(zip_filename, "w") as zipf:
           for clip in clips:
+            # Add file to zip with its proper custom name
             zipf.write(clip, os.path.basename(clip))
 
         st.success(
-            f"Done! Successfully created {len(clips)} clips with 'Part X'"
-            " text."
+            f"Done! Successfully created {len(clips)} clips with custom names"
+            " and text."
         )
 
-        # Provide Download Button for ZIP
         with open(zip_filename, "rb") as f:
           st.download_button(
               label="📥 Download All Clips (.zip)",
               data=f,
-              file_name="video_parts.zip",
+              file_name="Follow_My_Page_Clips.zip",
               mime="application/zip",
           )
       else:
         st.error(
-            "Could not process the video. Please try a different video format"
-            " (like .mp4)."
+            "Could not process the video. Please try a different video format."
         )
