@@ -9,7 +9,7 @@ st.set_page_config(page_title="FB Reels Splitter & Auto-Poster", layout="wide")
 
 st.title("🎥 Auto Video Splitter & Facebook Reels Auto-Poster")
 st.write(
-    "Upload video, automatically convert/crop to 9:16 Vertical Reel format, and post directly as Facebook Reels."
+    "Upload video (MP4, MKV, AVI, MOV), automatically convert/crop to 9:16 Vertical Reel format, and post directly as Facebook Reels."
 )
 
 # --- SIDEBAR CONFIGURATION ---
@@ -39,7 +39,12 @@ if "is_stopped_due_to_error" not in st.session_state:
 
 # --- MAIN UI ---
 st.subheader("1️⃣ Upload & Split Settings")
-uploaded_file = st.file_uploader("Upload Video (MP4, MKV, AVI)", type=["mp4", "mov", "avi"])
+
+# Updated File Uploader with MKV / Matroska MIME types to fix "video/matroska" error
+uploaded_file = st.file_uploader(
+    "Upload Video (MP4, MKV, AVI, MOV)", 
+    type=["mp4", "mkv", "avi", "mov", "matroska", "x-matroska"]
+)
 
 col1, col2, col3 = st.columns(3)
 with col1:
@@ -128,11 +133,16 @@ def post_reel_with_retry(video_path, caption, page_id, access_token, max_retries
 
 # --- UPLOAD & PROCESS LOGIC ---
 if uploaded_file is not None:
-    input_path = "input_video.mp4"
+    # Preserve original extension
+    file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+    if not file_extension:
+        file_extension = ".mkv" if "matroska" in uploaded_file.type else ".mp4"
+        
+    input_path = f"input_video{file_extension}"
     with open(input_path, "wb") as f:
         f.write(uploaded_file.read())
 
-    st.success("Video upload ho gayi hai!")
+    st.success(f"Video ({file_extension.upper()}) upload ho gayi hai!")
 
     btn_col1, btn_col2 = st.columns(2)
     start_btn = btn_col1.button("🚀 Process, Convert to 9:16 Reel & Post")
@@ -161,7 +171,6 @@ if uploaded_file is not None:
 
                     text_to_draw = f"Part {part_num}"
                     
-                    # 9:16 Vertical Reel Filter + Top-Right Text Overlay
                     video_filter = (
                         f"scale=1080:1920:force_original_aspect_ratio=increase,"
                         f"crop=1080:1920,"
@@ -169,8 +178,11 @@ if uploaded_file is not None:
                         f"borderw=3:bordercolor=black:x=w-text_w-50:y=100"
                     )
 
+                    # FFmpeg optimized command for MKV decoding
                     ffmpeg_cmd = [
                         "ffmpeg", "-y",
+                        "-analyzeduration", "10M",
+                        "-probesize", "10M",
                         "-ss", str(start_time),
                         "-i", input_path,
                         "-t", str(chunk_duration),
@@ -179,6 +191,8 @@ if uploaded_file is not None:
                         "-preset", "fast",
                         "-crf", "23",
                         "-c:a", "aac",
+                        "-b:a", "128k",
+                        "-pix_fmt", "yuv420p",
                         output_filepath,
                     ]
 
