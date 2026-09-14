@@ -1,4 +1,3 @@
-```python
 import os
 import json
 import math
@@ -1018,4 +1017,4 @@ else:
     st.caption(
         "🔴 OneDrive disconnected"
     )
-```
+
