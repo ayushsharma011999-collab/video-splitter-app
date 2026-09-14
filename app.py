@@ -149,7 +149,7 @@ def delete_saved_token():
 
 SCOPES = [
     "Files.ReadWrite.All",
-    "offline_access"
+    
 ]
 
 REDIRECT_URI = "http://localhost"
