@@ -9,6 +9,7 @@ from datetime import datetime, timedelta
 import json
 import time
 import threading
+from streamlit.runtime.scriptrunner import add_script_run_ctx  # Added for thread safety
 
 # =========================
 # CONFIG & UI STYLING
@@ -123,26 +124,6 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
 
     safe_watermark = watermark_text.replace("'", "").replace(":", "") if watermark_text else ""
 
-part_text = f"Part {i+1}/{total_clips}"
-
-overlay_filters = [
-    f"drawtext=text='{part_text}':fontcolor=white:fontsize=60:"
-    f"box=1:boxcolor=black@0.6:boxborderw=10:"
-    f"x=(w-text_w)/2:y=50"
-]
-
-if safe_watermark:
-    overlay_filters.append(
-        f"drawtext=text='{safe_watermark}':"
-        f"fontcolor=white:fontsize=48:"
-        f"box=1:boxcolor=black@0.5:boxborderw=10:"
-        f"x=w-tw-50:y=h-th-50"
-    )
-
-watermark_filter = "," + ",".join(overlay_filters)
-
-    final_vf = vf_scale + watermark_filter
-
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -151,6 +132,26 @@ watermark_filter = "," + ",".join(overlay_filters)
     for i in range(total_clips):
         start = i * clip_duration
         output_file = os.path.join(output_dir, f"Reel_Part_{i + 1}.mp4")
+
+        # FIX: Moved watermark & text filter generation inside the loop
+        part_text = f"Part {i+1}/{total_clips}"
+
+        overlay_filters = [
+            f"drawtext=text='{part_text}':fontcolor=white:fontsize=60:"
+            f"box=1:boxcolor=black@0.6:boxborderw=10:"
+            f"x=(w-text_w)/2:y=50"
+        ]
+
+        if safe_watermark:
+            overlay_filters.append(
+                f"drawtext=text='{safe_watermark}':"
+                f"fontcolor=white:fontsize=48:"
+                f"box=1:boxcolor=black@0.5:boxborderw=10:"
+                f"x=w-tw-50:y=h-th-50"
+            )
+
+        watermark_filter = "," + ",".join(overlay_filters)
+        final_vf = vf_scale + watermark_filter
 
         cmd = [
             FFMPEG,
@@ -194,9 +195,6 @@ def create_zip(files, zip_name):
 
 
 def publish_to_facebook(video_path, page_id, access_token, caption, post_type="Facebook Reel (Short)"):
-    """
-    Publishes video either as a Facebook Reel or a Normal Page Video based on user choice.
-    """
     try:
         if post_type == "Facebook Reel (Short)":
             add_log(f"Initiating Facebook Reel upload for {os.path.basename(video_path)}...")
@@ -235,7 +233,7 @@ def publish_to_facebook(video_path, page_id, access_token, caption, post_type="F
                 add_log(f"FB Reel Publish Failed: {pub_data}")
                 return False, f"Publish Error: {pub_data}"
 
-        else:  # Normal Video Post
+        else:
             add_log(f"Initiating Normal Page Video upload for {os.path.basename(video_path)}...")
             upload_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
             
@@ -314,7 +312,6 @@ with st.sidebar:
     fb_page_id = st.text_input("Facebook Page ID", placeholder="e.g. 1092837465")
     fb_access_token = st.text_input("Page Access Token", type="password", placeholder="EAAG...")
     
-    # NEW: Toggle between Reel or Normal Video post type
     fb_post_type = st.selectbox(
         "Select Facebook Post Type",
         ["Facebook Reel (Short)", "Normal Page Video Post"]
@@ -323,7 +320,6 @@ with st.sidebar:
     default_caption = st.text_area("Default Caption", value="Check out this amazing clip! 🔥")
 
 
-# Handle file upload persistence
 if uploaded_file is not None:
     temp_input_path = os.path.join("/tmp", uploaded_file.name)
     if st.session_state.input_file != temp_input_path:
@@ -413,6 +409,7 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                     args=(st.session_state.clips, fb_page_id, fb_access_token, default_caption, fb_post_type),
                     daemon=True
                 )
+                add_script_run_ctx(bg_thread) # FIX: Makes Streamlit session access thread-safe
                 bg_thread.start()
                 st.success(f"✅ Hourly background queue started for {fb_post_type}!")
 
