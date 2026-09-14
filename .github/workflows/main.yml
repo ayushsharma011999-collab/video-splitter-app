@@ -1,403 +1,601 @@
 name: Facebook Auto Poster - Test
 
 on:
-  workflow_dispatch:
+workflow_dispatch:
 
 jobs:
-  publish-one-video:
-    runs-on: ubuntu-latest
+publish-one-video:
+runs-on: ubuntu-latest
 
-    steps:
+```
+steps:
 
-      # --------------------------------------------------
-      # 1. Get Microsoft Graph Token
-      # --------------------------------------------------
-      - name: Get Microsoft Graph token
-        env:
-          TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-        run: |
-          echo "Getting Microsoft Graph token..."
+  # --------------------------------------------------
+  # 1. Get Microsoft Graph Token
+  # --------------------------------------------------
+  - name: Get Microsoft Graph token
+    env:
+      TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+    run: |
+      set -e
 
-          RESPONSE=$(curl -s -X POST \
-            "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
-            -H "Content-Type: application/x-www-form-urlencoded" \
-            --data-urlencode "client_id=${CLIENT_ID}" \
-            --data-urlencode "client_secret=${CLIENT_SECRET}" \
-            --data-urlencode "scope=https://graph.microsoft.com/.default" \
-            --data-urlencode "grant_type=client_credentials")
+      echo "Getting Microsoft Graph token..."
 
-          TOKEN=$(python -c "import json; print(json.loads('''$RESPONSE''').get('access_token',''))")
+      curl -sS -X POST \
+        "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+        -H "Content-Type: application/x-www-form-urlencoded" \
+        --data-urlencode "client_id=${CLIENT_ID}" \
+        --data-urlencode "client_secret=${CLIENT_SECRET}" \
+        --data-urlencode "scope=https://graph.microsoft.com/.default" \
+        --data-urlencode "grant_type=client_credentials" \
+        -o token_response.json
 
-          if [ -z "$TOKEN" ]; then
-            echo "ERROR: Graph token could not be obtained."
-            echo "$RESPONSE"
-            exit 1
-          fi
+      TOKEN=$(python - <<'PY'
+      import json
 
-          echo "GRAPH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+      with open("token_response.json", "r", encoding="utf-8") as f:
+          data = json.load(f)
 
-          echo "Graph token obtained successfully."
+      print(data.get("access_token", ""))
+      PY
+      )
 
+      if [ -z "$TOKEN" ]; then
+        echo "ERROR: Graph token could not be obtained."
+        cat token_response.json
+        exit 1
+      fi
 
-      # --------------------------------------------------
-      # 2. Create working folders
-      # --------------------------------------------------
-      - name: Prepare folders
-        run: |
-          mkdir -p pending_files
-          mkdir -p posted_files
+      echo "GRAPH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
 
-          echo "Folders prepared."
-
-
-      # --------------------------------------------------
-      # 3. Get Pending_Posts folder contents
-      # --------------------------------------------------
-      - name: List Pending_Posts
-        env:
-          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-        run: |
-          echo "Reading Pending_Posts..."
-
-          curl -s \
-            -H "Authorization: Bearer $GRAPH_TOKEN" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts:/children" \
-            -o pending_list.json
-
-          echo "Pending_Posts contents:"
-          cat pending_list.json
+      echo "Graph token obtained successfully."
 
 
-      # --------------------------------------------------
-      # 4. Download metadata JSON
-      # --------------------------------------------------
-      - name: Download metadata
-        env:
-          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import subprocess
-          import sys
+  # --------------------------------------------------
+  # 2. Create working folders
+  # --------------------------------------------------
+  - name: Prepare folders
+    run: |
+      set -e
 
-          with open("pending_list.json", "r", encoding="utf-8") as f:
+      mkdir -p pending_files
+      mkdir -p posted_files
+
+      echo "Folders prepared."
+
+
+  # --------------------------------------------------
+  # 3. Get Pending_Posts folder contents
+  # --------------------------------------------------
+  - name: List Pending_Posts
+    env:
+      GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+    run: |
+      set -e
+
+      echo "Reading Pending_Posts..."
+
+      HTTP_CODE=$(curl -sS \
+        -o pending_list.json \
+        -w "%{http_code}" \
+        -H "Authorization: Bearer $GRAPH_TOKEN" \
+        "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts:/children")
+
+      echo "Graph HTTP status: $HTTP_CODE"
+
+      if [ "$HTTP_CODE" != "200" ]; then
+        echo "ERROR: Could not read Pending_Posts."
+        cat pending_list.json
+        exit 1
+      fi
+
+      echo "Pending_Posts response received."
+
+      python - <<'PY'
+      import json
+
+      with open("pending_list.json", "r", encoding="utf-8") as f:
+          data = json.load(f)
+
+      files = data.get("value", [])
+
+      print(f"Found {len(files)} item(s) in Pending_Posts.")
+
+      for item in files:
+          print("-", item.get("name", "UNKNOWN"))
+      PY
+
+
+  # --------------------------------------------------
+  # 4. Download metadata JSON
+  # --------------------------------------------------
+  - name: Download metadata
+    run: |
+      set -e
+
+      python - <<'PY'
+      import json
+      import subprocess
+      import sys
+
+      with open("pending_list.json", "r", encoding="utf-8") as f:
+          data = json.load(f)
+
+      files = data.get("value", [])
+
+      metadata = None
+
+      for item in files:
+          name = item.get("name", "")
+
+          if name.lower().endswith("_metadata.json"):
+              metadata = item
+              break
+
+      if not metadata:
+          print("ERROR: No metadata JSON found.")
+          sys.exit(1)
+
+      name = metadata["name"]
+      download_url = metadata.get("@microsoft.graph.downloadUrl")
+
+      if not download_url:
+          print("ERROR: Metadata download URL not found.")
+          sys.exit(1)
+
+      print(f"Downloading metadata: {name}")
+
+      subprocess.run(
+          [
+              "curl",
+              "-L",
+              "-sS",
+              download_url,
+              "-o",
+              f"pending_files/{name}"
+          ],
+          check=True
+      )
+
+      print("Metadata downloaded successfully.")
+      PY
+
+
+  # --------------------------------------------------
+  # 5. Read metadata
+  # --------------------------------------------------
+  - name: Read metadata
+    run: |
+      set -e
+
+      python - <<'PY'
+      import json
+      import glob
+      import sys
+
+      files = glob.glob("pending_files/*_metadata.json")
+
+      if not files:
+          print("ERROR: Metadata file not found.")
+          sys.exit(1)
+
+      metadata_file = files[0]
+
+      with open(metadata_file, "r", encoding="utf-8") as f:
+          data = json.load(f)
+
+      print("Metadata:")
+      print(json.dumps(data, indent=2, ensure_ascii=False))
+
+      caption = data.get("caption", "")
+      page_id = data.get("facebook_page_id", "")
+      post_type = data.get("post_type", "Video")
+
+      with open("post_caption.txt", "w", encoding="utf-8") as f:
+          f.write(caption)
+
+      with open("page_id.txt", "w", encoding="utf-8") as f:
+          f.write(page_id)
+
+      with open("post_type.txt", "w", encoding="utf-8") as f:
+          f.write(post_type)
+
+      print("")
+      print("Post type:", post_type)
+      print("Page ID present:", bool(page_id))
+      print("Caption present:", bool(caption))
+      PY
+
+
+  # --------------------------------------------------
+  # 6. Download FIRST video only
+  # --------------------------------------------------
+  - name: Download first pending video
+    run: |
+      set -e
+
+      python - <<'PY'
+      import json
+      import subprocess
+      import sys
+
+      with open("pending_list.json", "r", encoding="utf-8") as f:
+          data = json.load(f)
+
+      files = data.get("value", [])
+
+      videos = [
+          item
+          for item in files
+          if item.get("name", "").lower().endswith(".mp4")
+      ]
+
+      videos.sort(key=lambda x: x.get("name", ""))
+
+      if not videos:
+          print("ERROR: No MP4 video found in Pending_Posts.")
+          sys.exit(1)
+
+      video = videos[0]
+
+      name = video["name"]
+      item_id = video["id"]
+      download_url = video.get("@microsoft.graph.downloadUrl")
+
+      if not download_url:
+          print("ERROR: Video download URL not found.")
+          sys.exit(1)
+
+      print(f"Selected video: {name}")
+      print(f"Item ID found: {bool(item_id)}")
+
+      subprocess.run(
+          [
+              "curl",
+              "-L",
+              "-sS",
+              download_url,
+              "-o",
+              f"pending_files/{name}"
+          ],
+          check=True
+      )
+
+      with open("selected_video.txt", "w", encoding="utf-8") as f:
+          f.write(name)
+
+      with open("selected_item_id.txt", "w", encoding="utf-8") as f:
+          f.write(item_id)
+
+      print("Video downloaded successfully.")
+      PY
+
+
+  # --------------------------------------------------
+  # 7. Verify selected video
+  # --------------------------------------------------
+  - name: Verify selected video
+    run: |
+      set -e
+
+      VIDEO=$(cat selected_video.txt)
+
+      echo "Selected video:"
+      echo "$VIDEO"
+
+      echo ""
+      echo "Video details:"
+
+      ls -lh "pending_files/$VIDEO"
+
+      FILE_SIZE=$(stat -c%s "pending_files/$VIDEO")
+
+      echo ""
+      echo "File size: $FILE_SIZE bytes"
+
+      if [ "$FILE_SIZE" -le 0 ]; then
+        echo "ERROR: Downloaded video is empty."
+        exit 1
+      fi
+
+
+  # --------------------------------------------------
+  # 8. Publish video to Facebook Page
+  # --------------------------------------------------
+  - name: Publish video to Facebook
+    env:
+      FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
+      FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
+    run: |
+      set -e
+
+      VIDEO=$(cat selected_video.txt)
+      CAPTION=$(cat post_caption.txt)
+
+      echo "Publishing video:"
+      echo "$VIDEO"
+
+      if [ -z "$FACEBOOK_PAGE_ID" ]; then
+        echo "ERROR: FACEBOOK_PAGE_ID secret is empty."
+        exit 1
+      fi
+
+      if [ -z "$FACEBOOK_PAGE_ACCESS_TOKEN" ]; then
+        echo "ERROR: FACEBOOK_PAGE_ACCESS_TOKEN secret is empty."
+        exit 1
+      fi
+
+      curl -sS -X POST \
+        "https://graph.facebook.com/v23.0/${FACEBOOK_PAGE_ID}/videos" \
+        -H "Authorization: Bearer ${FACEBOOK_PAGE_ACCESS_TOKEN}" \
+        -F "source=@pending_files/${VIDEO}" \
+        --form-string "description=${CAPTION}" \
+        -o facebook_response.json \
+        -w "%{http_code}" \
+        > facebook_http_code.txt
+
+      HTTP_CODE=$(cat facebook_http_code.txt)
+
+      echo ""
+      echo "Facebook HTTP status: $HTTP_CODE"
+
+      echo "Facebook response:"
+      cat facebook_response.json
+
+      echo ""
+
+      if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+        echo "ERROR: Facebook API returned HTTP $HTTP_CODE."
+        exit 1
+      fi
+
+      python - <<'PY'
+      import json
+      import sys
+
+      with open("facebook_response.json", "r", encoding="utf-8") as f:
+          data = json.load(f)
+
+      video_id = data.get("id", "")
+
+      if not video_id:
+          print("ERROR: Facebook response does not contain video ID.")
+          sys.exit(1)
+
+      with open("facebook_video_id.txt", "w", encoding="utf-8") as f:
+          f.write(video_id)
+
+      print("SUCCESS: Facebook video published.")
+      print("Facebook Video ID:", video_id)
+      PY
+
+
+  # --------------------------------------------------
+  # 9. Get / Create Posted folder
+  # --------------------------------------------------
+  - name: Find or create Posted folder
+    env:
+      GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+    run: |
+      set -e
+
+      echo "Checking Posted folder..."
+
+      HTTP_CODE=$(curl -sS \
+        -o posted_response.json \
+        -w "%{http_code}" \
+        -H "Authorization: Bearer $GRAPH_TOKEN" \
+        "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Posted")
+
+      echo "Graph HTTP status: $HTTP_CODE"
+
+      echo "Response preview:"
+      head -c 500 posted_response.json
+      echo ""
+
+      # ---------------------------------------------
+      # Posted folder already exists
+      # ---------------------------------------------
+      if [ "$HTTP_CODE" = "200" ]; then
+
+        python - <<'PY'
+      import json
+      import sys
+
+      try:
+          with open("posted_response.json", "r", encoding="utf-8") as f:
               data = json.load(f)
+      except Exception as e:
+          print("ERROR: Could not parse Graph response.")
+          print(e)
+          sys.exit(1)
 
-          files = data.get("value", [])
+      posted_id = data.get("id", "")
 
-          metadata = None
+      if not posted_id:
+          print("ERROR: Posted folder ID not found.")
+          sys.exit(1)
 
-          for item in files:
-              name = item.get("name", "")
+      with open("posted_folder_id.txt", "w", encoding="utf-8") as f:
+          f.write(posted_id)
 
-              if name.endswith("_metadata.json"):
-                  metadata = item
-                  break
+      print("Posted folder found.")
+      print("Posted folder ID saved.")
+      PY
 
-          if not metadata:
-              print("ERROR: No metadata JSON found.")
-              sys.exit(1)
+      # ---------------------------------------------
+      # Posted folder does not exist
+      # ---------------------------------------------
+      elif [ "$HTTP_CODE" = "404" ]; then
 
-          name = metadata["name"]
-          download_url = metadata.get("@microsoft.graph.downloadUrl")
+        echo "Posted folder not found."
+        echo "Creating Posted folder..."
 
-          if not download_url:
-              print("ERROR: Metadata download URL not found.")
-              sys.exit(1)
+        CREATE_HTTP_CODE=$(curl -sS \
+          -o create_response.json \
+          -w "%{http_code}" \
+          -X POST \
+          -H "Authorization: Bearer $GRAPH_TOKEN" \
+          -H "Content-Type: application/json" \
+          -d '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
+          "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children")
 
-          print(f"Downloading metadata: {name}")
+        echo "Create folder HTTP status: $CREATE_HTTP_CODE"
 
-          subprocess.run(
-              ["curl", "-L", "-s", download_url, "-o", f"pending_files/{name}"],
-              check=True
-          )
+        echo "Create response preview:"
+        head -c 500 create_response.json
+        echo ""
 
-          print("Metadata downloaded successfully.")
-          PY
+        if [ "$CREATE_HTTP_CODE" != "201" ]; then
+          echo "ERROR: Could not create Posted folder."
+          cat create_response.json
+          exit 1
+        fi
 
+        python - <<'PY'
+      import json
+      import sys
 
-      # --------------------------------------------------
-      # 5. Read metadata
-      # --------------------------------------------------
-      - name: Read metadata
-        run: |
-          python - <<'PY'
-          import json
-          import glob
-          import sys
-          import os
-
-          files = glob.glob("pending_files/*_metadata.json")
-
-          if not files:
-              print("ERROR: Metadata file not found.")
-              sys.exit(1)
-
-          metadata_file = files[0]
-
-          with open(metadata_file, "r", encoding="utf-8") as f:
+      try:
+          with open("create_response.json", "r", encoding="utf-8") as f:
               data = json.load(f)
+      except Exception as e:
+          print("ERROR: Could not parse create response.")
+          print(e)
+          sys.exit(1)
 
-          print("Metadata:")
-          print(json.dumps(data, indent=2, ensure_ascii=False))
+      posted_id = data.get("id", "")
 
-          caption = data.get("caption", "")
-          page_id = data.get("facebook_page_id", "")
-          post_type = data.get("post_type", "Video")
+      if not posted_id:
+          print("ERROR: Created folder ID not found.")
+          sys.exit(1)
 
-          with open("post_caption.txt", "w", encoding="utf-8") as f:
-              f.write(caption)
+      with open("posted_folder_id.txt", "w", encoding="utf-8") as f:
+          f.write(posted_id)
 
-          with open("page_id.txt", "w", encoding="utf-8") as f:
-              f.write(page_id)
+      print("Posted folder created successfully.")
+      print("Posted folder ID saved.")
+      PY
 
-          with open("post_type.txt", "w", encoding="utf-8") as f:
-              f.write(post_type)
+      # ---------------------------------------------
+      # Unexpected response
+      # ---------------------------------------------
+      else
 
-          print("")
-          print("Post type:", post_type)
-          print("Page ID present:", bool(page_id))
-          print("Caption present:", bool(caption))
-          PY
+        echo "ERROR: Unexpected Graph API response."
+        echo "HTTP status: $HTTP_CODE"
+        cat posted_response.json
+        exit 1
 
+      fi
 
-      # --------------------------------------------------
-      # 6. Download FIRST video only
-      # --------------------------------------------------
-      - name: Download first pending video
-        env:
-          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import subprocess
-          import sys
+      POSTED_ID=$(cat posted_folder_id.txt)
 
-          with open("pending_list.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
+      if [ -z "$POSTED_ID" ]; then
+        echo "ERROR: Posted folder ID is empty."
+        exit 1
+      fi
 
-          files = data.get("value", [])
+      echo "POSTED_FOLDER_ID=$POSTED_ID" >> "$GITHUB_ENV"
 
-          videos = [
-              item for item in files
-              if item.get("name", "").lower().endswith(".mp4")
-          ]
-
-          videos.sort(key=lambda x: x.get("name", ""))
-
-          if not videos:
-              print("ERROR: No MP4 video found in Pending_Posts.")
-              sys.exit(1)
-
-          video = videos[0]
-
-          name = video["name"]
-          download_url = video.get("@microsoft.graph.downloadUrl")
-
-          if not download_url:
-              print("ERROR: Video download URL not found.")
-              sys.exit(1)
-
-          print(f"Selected video: {name}")
-
-          subprocess.run(
-              [
-                  "curl",
-                  "-L",
-                  "-s",
-                  download_url,
-                  "-o",
-                  f"pending_files/{name}"
-              ],
-              check=True
-          )
-
-          with open("selected_video.txt", "w", encoding="utf-8") as f:
-              f.write(name)
-
-          with open("selected_item_id.txt", "w", encoding="utf-8") as f:
-              f.write(video["id"])
-
-          print("Video downloaded successfully.")
-          PY
+      echo ""
+      echo "=========================================="
+      echo "Posted folder ready."
+      echo "=========================================="
 
 
-      # --------------------------------------------------
-      # 7. Show selected video
-      # --------------------------------------------------
-      - name: Verify selected video
-        run: |
-          VIDEO=$(cat selected_video.txt)
+  # --------------------------------------------------
+  # 10. Move successfully posted video to Posted
+  # --------------------------------------------------
+  - name: Move video to Posted
+    env:
+      GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+    run: |
+      set -e
 
-          echo "Selected video:"
-          echo "$VIDEO"
+      ITEM_ID=$(cat selected_item_id.txt)
+      VIDEO=$(cat selected_video.txt)
 
-          echo ""
-          echo "Video details:"
-          ls -lh "pending_files/$VIDEO"
+      echo "Moving video:"
+      echo "$VIDEO"
 
+      curl -sS -X PATCH \
+        "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${ITEM_ID}" \
+        -H "Authorization: Bearer $GRAPH_TOKEN" \
+        -H "Content-Type: application/json" \
+        -d "{\"parentReference\":{\"id\":\"${POSTED_FOLDER_ID}\"}}" \
+        -o move_response.json \
+        -w "%{http_code}" \
+        > move_http_code.txt
 
-      # --------------------------------------------------
-      # 8. Publish video to Facebook Page
-      # --------------------------------------------------
-      - name: Publish video to Facebook
-        env:
-          FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
-          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
-        run: |
-          VIDEO=$(cat selected_video.txt)
-          CAPTION=$(cat post_caption.txt)
+      HTTP_CODE=$(cat move_http_code.txt)
 
-          echo "Publishing:"
-          echo "$VIDEO"
+      echo ""
+      echo "Move HTTP status: $HTTP_CODE"
 
-          RESPONSE=$(curl -s -X POST \
-            "https://graph.facebook.com/v23.0/${FACEBOOK_PAGE_ID}/videos" \
-            -H "Authorization: Bearer ${FACEBOOK_PAGE_ACCESS_TOKEN}" \
-            -F "source=@pending_files/${VIDEO}" \
-            --form-string "description=${CAPTION}")
+      echo "Move response:"
+      cat move_response.json
 
-          echo "Facebook response:"
-          echo "$RESPONSE"
+      echo ""
 
-          VIDEO_ID=$(python -c "import json; print(json.loads('''$RESPONSE''').get('id',''))")
+      if [ "$HTTP_CODE" -lt 200 ] || [ "$HTTP_CODE" -ge 300 ]; then
+        echo "ERROR: Video was published to Facebook, but OneDrive move failed."
+        exit 1
+      fi
 
-          if [ -z "$VIDEO_ID" ]; then
-            echo ""
-            echo "ERROR: Facebook video publishing failed."
-            exit 1
-          fi
+      python - <<'PY'
+      import json
+      import sys
 
-          echo "$VIDEO_ID" > facebook_video_id.txt
+      with open("move_response.json", "r", encoding="utf-8") as f:
+          data = json.load(f)
 
-          echo ""
-          echo "SUCCESS: Video published to Facebook."
-          echo "Facebook Video ID: $VIDEO_ID"
+      moved_id = data.get("id", "")
 
+      if not moved_id:
+          print("ERROR: Move response does not contain item ID.")
+          sys.exit(1)
 
-            # --------------------------------------------------
-       # 9. Get Posted folder
-       # --------------------------------------------------
-       - name: Find Posted folder
-         env:
-           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-         run: |
-           RESPONSE=$(curl -s \
-             -H "Authorization: Bearer $GRAPH_TOKEN" \
-             "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Posted")
-
-           echo "Posted folder response:"
-           echo "$RESPONSE"
-
-           # Save response to file instead of passing through variable
-           echo "$RESPONSE" > posted_response.json
-
-           python - <<'PY'
-           import json
-           import sys
-
-           with open("posted_response.json", "r", encoding="utf-8") as f:
-               data = json.load(f)
-
-           POSTED_ID = data.get("id", "")
-
-           if not POSTED_ID:
-               print("Posted folder does not exist. Creating it...")
-               sys.exit(2)  # Exit with code 2 to signal creation needed
-           
-           with open("posted_folder_id.txt", "w") as f:
-               f.write(POSTED_ID)
-           
-           print("Posted folder found.")
-           PY
-
-           if [ $? -eq 2 ]; then
-             CREATE_RESPONSE=$(curl -s -X POST \
-               -H "Authorization: Bearer $GRAPH_TOKEN" \
-               -H "Content-Type: application/json" \
-               -d '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
-               "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children")
-
-             echo "$CREATE_RESPONSE"
-             echo "$CREATE_RESPONSE" > create_response.json
-
-             python - <<'PY'
-             import json
-             import sys
-
-             with open("create_response.json", "r", encoding="utf-8") as f:
-                 data = json.load(f)
-
-             POSTED_ID = data.get("id", "")
-
-             if not POSTED_ID:
-                 print("ERROR: Could not create Posted folder.")
-                 sys.exit(1)
-
-             with open("posted_folder_id.txt", "w") as f:
-                 f.write(POSTED_ID)
-             
-             print("Posted folder created successfully.")
-             PY
-           fi
-
-           POSTED_ID=$(cat posted_folder_id.txt)
-           echo "POSTED_FOLDER_ID=$POSTED_ID" >> "$GITHUB_ENV"
-           echo "Posted folder ready."
-
-      # --------------------------------------------------
-      # 10. Move successfully posted video to Posted
-      # --------------------------------------------------
-      - name: Move video to Posted
-        env:
-          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-        run: |
-          ITEM_ID=$(cat selected_item_id.txt)
-          VIDEO=$(cat selected_video.txt)
-
-          echo "Moving:"
-          echo "$VIDEO"
-
-          RESPONSE=$(curl -s -X PATCH \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${ITEM_ID}" \
-            -H "Authorization: Bearer $GRAPH_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "{\"parentReference\":{\"id\":\"${POSTED_FOLDER_ID}\"}}")
-
-          echo "Move response:"
-          echo "$RESPONSE"
-
-          MOVED_ID=$(python -c "import json; print(json.loads('''$RESPONSE''').get('id',''))")
-
-          if [ -z "$MOVED_ID" ]; then
-            echo "ERROR: Video was published but could not be moved."
-            exit 1
-          fi
-
-          echo ""
-          echo "SUCCESS:"
-          echo "Facebook published: YES"
-          echo "OneDrive moved to Posted: YES"
+      print("OneDrive move successful.")
+      print("Moved item ID:", moved_id)
+      PY
 
 
-      # --------------------------------------------------
-      # 11. Final result
-      # --------------------------------------------------
-      - name: Final result
-        run: |
-          echo "=========================================="
-          echo "       FACEBOOK AUTO POST TEST"
-          echo "=========================================="
-          echo ""
-          echo "Video:"
-          cat selected_video.txt
-          echo ""
-          echo "Facebook Video ID:"
-          cat facebook_video_id.txt
-          echo ""
-          echo "Status: SUCCESS"
-          echo "=========================================="
+  # --------------------------------------------------
+  # 11. Final result
+  # --------------------------------------------------
+  - name: Final result
+    run: |
+      echo ""
+      echo "=========================================="
+      echo "       FACEBOOK AUTO POST TEST"
+      echo "=========================================="
+      echo ""
+
+      echo "Video:"
+      cat selected_video.txt
+
+      echo ""
+
+      echo "Facebook Video ID:"
+      cat facebook_video_id.txt
+
+      echo ""
+
+      echo "Status: SUCCESS"
+
+      echo ""
+      echo "Flow:"
+      echo "Pending_Posts"
+      echo "      ↓"
+      echo "GitHub Actions"
+      echo "      ↓"
+      echo "Facebook Page"
+      echo "      ↓"
+      echo "Posted"
+
+      echo ""
+      echo "=========================================="
+```
