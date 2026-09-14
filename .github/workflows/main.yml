@@ -7,7 +7,6 @@ jobs:
 publish-one-video:
 runs-on: ubuntu-latest
 
-```
 steps:
   - name: Get Microsoft Graph token
     env:
