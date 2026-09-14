@@ -16,14 +16,9 @@ st.set_page_config(
     layout="wide"
 )
 
-# Custom Dashboard CSS Injection
 st.markdown("""
     <style>
-    /* Main background & font adjustments */
-    .main {
-        background-color: #0e1117;
-    }
-    /* Card Container Styling */
+    .main { background-color: #0e1117; }
     .dashboard-card {
         background-color: #161b22;
         border: 1px solid #30363d;
@@ -32,17 +27,11 @@ st.markdown("""
         box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
         margin-bottom: 20px;
     }
-    /* Metric styling */
     .metric-value {
         font-size: 24px;
         font-weight: bold;
         color: #58a6ff;
     }
-    /* Header title style */
-    h1, h2, h3 {
-        letter-spacing: -0.5px;
-    }
-    /* Custom button spacing */
     .stButton button {
         width: 100%;
         border-radius: 8px;
@@ -52,7 +41,6 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-# Find FFmpeg installed by packages.txt
 FFMPEG = shutil.which("ffmpeg")
 
 if not FFMPEG:
@@ -101,7 +89,6 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
 
     clips = []
     
-    # Aspect Ratio Filter mapping
     if "9:16" in aspect_ratio:
         vf_scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
     elif "16:9" in aspect_ratio:
@@ -111,7 +98,6 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
     else:
         vf_scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 
-    # Watermark Filter logic
     if watermark_text.strip():
         safe_text = watermark_text.replace("'", "").replace(":", "")
         watermark_filter = f",drawtext=text='{safe_text}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.5:boxborderw=10:x=w-tw-50:y=h-th-50"
@@ -120,7 +106,6 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
 
     final_vf = vf_scale + watermark_filter
 
-    # Progress bar setup inside dashboard card look
     progress_bar = st.progress(0)
     status_text = st.empty()
 
@@ -166,15 +151,73 @@ def create_zip(files, zip_name):
             zip_file.write(file, os.path.basename(file))
 
 
+def publish_to_facebook_reel(video_path, page_id, access_token, caption):
+    """
+    Publishes a video file as a Facebook Reel using Meta Graph API.
+    Step 1: Initialize upload session.
+    Step 2: Upload binary video chunks.
+    Step 3: Publish the reel.
+    """
+    try:
+        # Step 1: Initialize upload session
+        init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
+        init_payload = {
+            "upload_phase": "start",
+            "access_token": access_token
+        }
+        res = requests.post(init_url, data=init_payload)
+        res_data = res.json()
+
+        if "video_id" not in res_data or "upload_url" not in res_data:
+            return False, f"Initialization Failed: {res_data}"
+
+        video_id = res_data["video_id"]
+        upload_url = res_data["upload_url"]
+        file_size = os.path.getsize(video_path)
+
+        # Step 2: Upload video binary data to rupload endpoint
+        with open(video_path, "rb") as video_file:
+            headers = {
+                "Authorization": f"OAuth {access_token}",
+                "offset": "0",
+                "file_size": str(file_size)
+            }
+            upload_res = requests.post(upload_url, data=video_file, headers=headers)
+            upload_data = upload_res.json()
+
+            if not upload_data.get("success", False) and upload_res.status_code != 200:
+                # Some successful responses return status 200 directly without explicit success flag
+                pass
+
+        # Step 3: Publish the Reel session
+        publish_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
+        publish_payload = {
+            "access_token": access_token,
+            "video_id": video_id,
+            "upload_phase": "finish",
+            "video_state": "PUBLISHED",
+            "description": caption
+        }
+        pub_res = requests.post(publish_url, data=publish_payload)
+        pub_data = pub_res.json()
+
+        if pub_data.get("success", False):
+            return True, "Reel successfully published to Facebook Page! 🚀"
+        else:
+            return False, f"Publish Error: {pub_data}"
+
+    except Exception as e:
+        return False, str(e)
+
+
 # =========================
 # DASHBOARD LAYOUT (UI)
 # =========================
 
-# Top Header Banner
 st.markdown("""
     <div style="padding: 10px 0; border-bottom: 1px solid #30363d; margin-bottom: 25px;">
-        <h1 style="color: #c9d1d9; margin: 0; font-size: 28px;">🎬 Pro Video Studio Dashboard</h1>
-        <p style="color: #8b949e; margin: 5px 0 0 0;">Transform long videos into viral vertical shorts & reels instantly.</p>
+        <h1 style="color: #c9d1d9; margin: 0; font-size: 28px;">🎬 Pro Video Studio & FB Auto-Poster</h1>
+        <p style="color: #8b949e; margin: 5px 0 0 0;">Split videos into shorts & publish directly to Facebook Pages automatically.</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -191,28 +234,16 @@ with st.sidebar:
     st.markdown("---")
     st.markdown("### ⚙️ Video Parameters")
     
-    clip_duration = st.slider(
-        "Clip Duration (Seconds)",
-        min_value=15,
-        max_value=120,
-        value=60,
-        step=15
-    )
+    clip_duration = st.slider("Clip Duration (Sec)", 15, 120, 60, 15)
+    aspect_ratio = st.selectbox("Format", ["9:16 (Vertical / Reels)", "16:9 (YouTube)", "1:1 (Square)"])
+    watermark_text = st.text_input("🏷️ Watermark", placeholder="@Channel")
 
-    aspect_ratio = st.selectbox(
-        "Aspect Ratio Format",
-        [
-            "9:16 (Vertical / Reels / Shorts)",
-            "16:9 (Horizontal / YouTube)",
-            "1:1 (Square / Feed Post)"
-        ]
-    )
+    st.markdown("---")
+    st.markdown("### 📘 Facebook Auto-Post Setup")
+    fb_page_id = st.text_input("Facebook Page ID", placeholder="e.g. 1092837465")
+    fb_access_token = st.text_input("Page Access Token", type="password", placeholder="EAAG...")
+    default_caption = st.text_area("Default Reel Caption", value="Check out this amazing reel! 🔥 #Reels #Shorts")
 
-    watermark_text = st.text_input(
-        "🏷️ Watermark / Handle",
-        placeholder="@YourChannel",
-        max_chars=25
-    )
 
 # Handle file upload persistence
 if uploaded_file is not None:
@@ -224,16 +255,15 @@ if uploaded_file is not None:
         st.session_state.duration = get_video_duration(temp_input_path)
         st.session_state.clips = []
 
-# Main Dashboard Workspace
+# Main Workspace
 if st.session_state.input_file and os.path.exists(st.session_state.input_file):
     
-    # Metrics Row
     col_m1, col_m2, col_m3 = st.columns(3)
     with col_m1:
         st.markdown(f"""
             <div class="dashboard-card" style="text-align: center;">
                 <p style="color: #8b949e; margin:0;">File Name</p>
-                <p class="metric-value" style="font-size: 16px; overflow: hidden; text-overflow: ellipsis;">{os.path.basename(st.session_state.input_file)}</p>
+                <p class="metric-value" style="font-size: 15px; overflow: hidden;">{os.path.basename(st.session_state.input_file)}</p>
             </div>
         """, unsafe_allow_html=True)
     with col_m2:
@@ -247,22 +277,20 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
         est_clips = int(st.session_state.duration // clip_duration) + (1 if st.session_state.duration % clip_duration > 0 else 0)
         st.markdown(f"""
             <div class="dashboard-card" style="text-align: center;">
-                <p style="color: #8b949e; margin:0;">Estimated Clips</p>
-                <p class="metric-value">~ {est_clips} Parts</p>
+                <p style="color: #8b949e; margin:0;">Estimated Parts</p>
+                <p class="metric-value">~ {est_clips} Clips</p>
             </div>
         """, unsafe_allow_html=True)
 
-    # Action Trigger Section inside a card container
     st.markdown("### 🚀 Render Workspace")
-    with st.container():
-        col_btn1, col_btn2 = st.columns([2, 1])
-        with col_btn1:
-            start_process = st.button("⚡ Start Splitting & Processing", type="primary", use_container_width=True)
-        with col_btn2:
-            if st.button("🧹 Clear Workspace", use_container_width=True):
-                st.session_state.clips = []
-                st.session_state.input_file = None
-                st.rerun()
+    col_btn1, col_btn2 = st.columns([2, 1])
+    with col_btn1:
+        start_process = st.button("⚡ Start Splitting & Processing", type="primary", use_container_width=True)
+    with col_btn2:
+        if st.button("🧹 Clear Workspace", use_container_width=True):
+            st.session_state.clips = []
+            st.session_state.input_file = None
+            st.rerun()
 
     if start_process:
         output_dir = "/tmp/reels"
@@ -271,7 +299,7 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
         os.makedirs(output_dir)
 
         try:
-            with st.spinner("Rendering clips via FFmpeg engine..."):
+            with st.spinner("Rendering clips via FFmpeg..."):
                 st.session_state.clips = split_video(
                     st.session_state.input_file,
                     output_dir,
@@ -283,12 +311,11 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
             st.error("❌ Processing failed!")
             st.code(str(e))
 
-    # Output Gallery Section if clips are ready
+    # Output Gallery & FB Auto-Post Buttons
     if st.session_state.clips:
         st.markdown("---")
-        st.markdown("### 📦 Generated Output Gallery")
+        st.markdown("### 📦 Generated Clips & Social Publishing Hub")
         
-        # Download All ZIP Button at top of gallery
         zip_file = "/tmp/reels.zip"
         create_zip(st.session_state.clips, zip_file)
         if os.path.exists(zip_file):
@@ -304,7 +331,6 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
         
         st.markdown("<br>", unsafe_allow_html=True)
 
-        # Display Clips in a Grid layout (2 columns)
         clip_cols = st.columns(2)
         for idx, clip in enumerate(st.session_state.clips):
             with clip_cols[idx % 2]:
@@ -315,6 +341,8 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                         </div>
                     """, unsafe_allow_html=True)
                     st.video(clip)
+                    
+                    # Local Download button
                     with open(clip, "rb") as f:
                         st.download_button(
                             label=f"⬇️ Download {os.path.basename(clip)}",
@@ -323,13 +351,25 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                             mime="video/mp4",
                             key=f"dl_clip_{idx}"
                         )
-                    st.markdown("<br>", unsafe_allow_html=True)
+                    
+                    # Facebook Auto Post Trigger Button
+                    if st.button(f"🚀 Publish to Facebook Page (Reel #{idx+1})", key=f"fb_post_{idx}", type="secondary"):
+                        if not fb_page_id or not fb_access_token:
+                            st.error("⚠️ Please enter Facebook Page ID and Access Token in the sidebar!")
+                        else:
+                            with st.spinner(f"Publishing {os.path.basename(clip)} to Facebook..."):
+                                success, msg = publish_to_facebook_reel(clip, fb_page_id, fb_access_token, default_caption)
+                                if success:
+                                    st.success(msg)
+                                else:
+                                    st.error(msg)
+                    
+                    st.markdown("<br>", unsafe_allow_html=KeyError if 'KeyError' in globals() else "<br>")
 
 else:
-    # Empty State Dashboard View
     st.markdown("""
         <div style="text-align: center; padding: 60px 20px; background-color: #161b22; border: 1px dashed #30363d; border-radius: 12px;">
             <h3>📂 No Video Loaded Yet</h3>
-            <p style="color: #8b949e;">Please use the left sidebar to upload a video file (.mp4, .mov, .avi) to initialize the dashboard.</p>
+            <p style="color: #8b949e;">Please use the sidebar to upload a video file to begin automated processing and posting.</p>
         </div>
     """, unsafe_allow_html=True)
