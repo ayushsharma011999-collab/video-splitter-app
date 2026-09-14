@@ -279,45 +279,75 @@ jobs:
           echo "Facebook Video ID: $VIDEO_ID"
 
 
-      # --------------------------------------------------
-      # 9. Get Posted folder
-      # --------------------------------------------------
-      - name: Find Posted folder
-        env:
-          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-        run: |
-          RESPONSE=$(curl -s \
-            -H "Authorization: Bearer $GRAPH_TOKEN" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Posted")
+            # --------------------------------------------------
+       # 9. Get Posted folder
+       # --------------------------------------------------
+       - name: Find Posted folder
+         env:
+           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+         run: |
+           RESPONSE=$(curl -s \
+             -H "Authorization: Bearer $GRAPH_TOKEN" \
+             "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Posted")
 
-          echo "Posted folder response:"
-          echo "$RESPONSE"
+           echo "Posted folder response:"
+           echo "$RESPONSE"
 
-          POSTED_ID=$(python -c "import json; print(json.loads('''$RESPONSE''').get('id',''))")
+           # Save response to file instead of passing through variable
+           echo "$RESPONSE" > posted_response.json
 
-          if [ -z "$POSTED_ID" ]; then
-            echo "Posted folder does not exist. Creating it..."
+           python - <<'PY'
+           import json
+           import sys
 
-            CREATE_RESPONSE=$(curl -s -X POST \
-              -H "Authorization: Bearer $GRAPH_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
-              "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children")
+           with open("posted_response.json", "r", encoding="utf-8") as f:
+               data = json.load(f)
 
-            echo "$CREATE_RESPONSE"
+           POSTED_ID = data.get("id", "")
 
-            POSTED_ID=$(python -c "import json; print(json.loads('''$CREATE_RESPONSE''').get('id',''))")
-          fi
+           if not POSTED_ID:
+               print("Posted folder does not exist. Creating it...")
+               sys.exit(2)  # Exit with code 2 to signal creation needed
+           
+           with open("posted_folder_id.txt", "w") as f:
+               f.write(POSTED_ID)
+           
+           print("Posted folder found.")
+           PY
 
-          if [ -z "$POSTED_ID" ]; then
-            echo "ERROR: Could not find/create Posted folder."
-            exit 1
-          fi
+           if [ $? -eq 2 ]; then
+             CREATE_RESPONSE=$(curl -s -X POST \
+               -H "Authorization: Bearer $GRAPH_TOKEN" \
+               -H "Content-Type: application/json" \
+               -d '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
+               "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children")
 
-          echo "POSTED_FOLDER_ID=$POSTED_ID" >> "$GITHUB_ENV"
+             echo "$CREATE_RESPONSE"
+             echo "$CREATE_RESPONSE" > create_response.json
 
-          echo "Posted folder ready."
+             python - <<'PY'
+             import json
+             import sys
 
+             with open("create_response.json", "r", encoding="utf-8") as f:
+                 data = json.load(f)
+
+             POSTED_ID = data.get("id", "")
+
+             if not POSTED_ID:
+                 print("ERROR: Could not create Posted folder.")
+                 sys.exit(1)
+
+             with open("posted_folder_id.txt", "w") as f:
+                 f.write(POSTED_ID)
+             
+             print("Posted folder created successfully.")
+             PY
+           fi
+
+           POSTED_ID=$(cat posted_folder_id.txt)
+           echo "POSTED_FOLDER_ID=$POSTED_ID" >> "$GITHUB_ENV"
+           echo "Posted folder ready."
 
       # --------------------------------------------------
       # 10. Move successfully posted video to Posted
