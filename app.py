@@ -159,6 +159,7 @@ GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 def get_msal_app(client_id, tenant_id, client_secret):
 
+
     authority = (
         f"https://login.microsoftonline.com/{tenant_id}"
     )
@@ -168,7 +169,29 @@ def get_msal_app(client_id, tenant_id, client_secret):
         authority=authority,
         client_credential=client_secret
     )
+def get_application_access_token(client_id, tenant_id, client_secret):
 
+    authority = f"https://login.microsoftonline.com/{tenant_id}"
+
+    app = msal.ConfidentialClientApplication(
+        client_id=client_id,
+        authority=authority,
+        client_credential=client_secret
+    )
+
+    result = app.acquire_token_for_client(
+        scopes=[GRAPH_SCOPE]
+    )
+
+    if "access_token" not in result:
+        raise Exception(
+            result.get(
+                "error_description",
+                str(result)
+            )
+        )
+
+    return result["access_token"]
 
 # ============================================================
 # CREATE ONEDRIVE FOLDER
