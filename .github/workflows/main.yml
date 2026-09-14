@@ -1,4 +1,4 @@
-```yaml
+
 name: OneDrive Pending Posts Processor
 
 on:
@@ -167,4 +167,4 @@ jobs:
           echo ""
           echo "NOTE:"
           echo "This workflow does NOT publish anything to Facebook yet."
-```
+
