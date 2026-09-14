@@ -3,7 +3,7 @@ import json
 import re
 import shutil
 import subprocess
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -89,63 +89,6 @@ if "duration" not in st.session_state:
 if "onedrive_access_token" not in st.session_state:
     st.session_state.onedrive_access_token = None
 
-if "onedrive_refresh_token" not in st.session_state:
-    st.session_state.onedrive_refresh_token = None
-
-
-# ============================================================
-# TOKEN FILE
-# ============================================================
-
-TOKEN_FILE = "ms_token.json"
-
-
-def save_refresh_token(refresh_token):
-
-    if not refresh_token:
-        return
-
-    try:
-        with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-            json.dump(
-                {"refresh_token": refresh_token},
-                f,
-                indent=4
-            )
-    except Exception as e:
-        st.warning(f"Token save nahi ho paya: {e}")
-
-
-def load_refresh_token():
-
-    if not os.path.exists(TOKEN_FILE):
-        return None
-
-    try:
-        with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-
-        return data.get("refresh_token")
-
-    except Exception:
-        return None
-
-
-def delete_saved_token():
-
-    if os.path.exists(TOKEN_FILE):
-        try:
-            os.remove(TOKEN_FILE)
-        except Exception:
-            pass
-
-    st.session_state.onedrive_access_token = None
-    st.session_state.onedrive_refresh_token = None
-
-
-# ============================================================
-# MICROSOFT / ONEDRIVE CONFIG
-# ============================================================
 
 # ============================================================
 # MICROSOFT / ONEDRIVE CONFIG
@@ -157,8 +100,12 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
-def get_msal_app(client_id, tenant_id, client_secret):
 
+# ============================================================
+# MICROSOFT APP
+# ============================================================
+
+def get_msal_app(client_id, tenant_id, client_secret):
 
     authority = (
         f"https://login.microsoftonline.com/{tenant_id}"
@@ -169,9 +116,21 @@ def get_msal_app(client_id, tenant_id, client_secret):
         authority=authority,
         client_credential=client_secret
     )
-def get_application_access_token(client_id, tenant_id, client_secret):
 
-    authority = f"https://login.microsoftonline.com/{tenant_id}"
+
+# ============================================================
+# APPLICATION ACCESS TOKEN
+# ============================================================
+
+def get_application_access_token(
+    client_id,
+    tenant_id,
+    client_secret
+):
+
+    authority = (
+        f"https://login.microsoftonline.com/{tenant_id}"
+    )
 
     app = msal.ConfidentialClientApplication(
         client_id=client_id,
@@ -184,43 +143,89 @@ def get_application_access_token(client_id, tenant_id, client_secret):
     )
 
     if "access_token" not in result:
+
+        error_description = result.get(
+            "error_description",
+            "Unknown Microsoft authentication error."
+        )
+
         raise Exception(
-            result.get(
-                "error_description",
-                str(result)
-            )
+            error_description
         )
 
     return result["access_token"]
 
+
 # ============================================================
-# CREATE ONEDRIVE FOLDER
+# ONEDRIVE DRIVE BASE URL
 # ============================================================
 
-def ensure_onedrive_folder(access_token, folder_name):
+def get_onedrive_drive_url():
+
+    encoded_user = quote(
+        ONEDRIVE_USER,
+        safe=""
+    )
+
+    return (
+        f"{GRAPH_BASE_URL}/users/"
+        f"{encoded_user}/drive"
+    )
+
+
+# ============================================================
+# CREATE / CHECK ONEDRIVE FOLDER
+# ============================================================
+
+def ensure_onedrive_folder(
+    access_token,
+    folder_name
+):
 
     headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
+        "Authorization": f"Bearer {access_token}"
     }
 
-    check_url = (
-        "https://graph.microsoft.com/v1.0/"
-        f"me/drive/root:/{folder_name}"
+    encoded_folder = quote(
+        folder_name,
+        safe=""
     )
 
-    response = requests.get(
-        check_url,
-        headers=headers,
-        timeout=30
+    drive_url = get_onedrive_drive_url()
+
+    # --------------------------------------------------------
+    # CHECK FOLDER
+    # --------------------------------------------------------
+
+    check_url = (
+        f"{drive_url}/root:/"
+        f"{encoded_folder}"
     )
+
+    try:
+
+        response = requests.get(
+            check_url,
+            headers=headers,
+            timeout=30
+        )
+
+    except Exception as e:
+
+        return False, (
+            f"Folder check error: {e}"
+        )
 
     if response.status_code == 200:
+
         return True, "Folder already exists"
 
+    # --------------------------------------------------------
+    # CREATE FOLDER
+    # --------------------------------------------------------
+
     create_url = (
-        "https://graph.microsoft.com/v1.0/"
-        "me/drive/root/children"
+        f"{drive_url}/root/children"
     )
 
     payload = {
@@ -229,21 +234,36 @@ def ensure_onedrive_folder(access_token, folder_name):
         "@microsoft.graph.conflictBehavior": "fail"
     }
 
-    response = requests.post(
-        create_url,
-        headers=headers,
-        json=payload,
-        timeout=30
-    )
+    headers["Content-Type"] = "application/json"
+
+    try:
+
+        response = requests.post(
+            create_url,
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+
+    except Exception as e:
+
+        return False, (
+            f"Folder creation error: {e}"
+        )
 
     if response.status_code in [200, 201]:
+
         return True, "Folder created"
 
     # Folder may have been created meanwhile
     if response.status_code == 409:
+
         return True, "Folder already exists"
 
-    return False, response.text
+    return False, (
+        f"{response.status_code} - "
+        f"{response.text}"
+    )
 
 
 # ============================================================
@@ -257,21 +277,52 @@ def upload_large_file_to_onedrive(
 ):
 
     if not os.path.exists(file_path):
-        return False, "Local file nahi mili."
 
-    folder_ok, folder_msg = ensure_onedrive_folder(
-        access_token,
-        folder_name
+        return False, (
+            "Local file nahi mili."
+        )
+
+    # --------------------------------------------------------
+    # ENSURE FOLDER
+    # --------------------------------------------------------
+
+    folder_ok, folder_msg = (
+        ensure_onedrive_folder(
+            access_token,
+            folder_name
+        )
     )
 
     if not folder_ok:
-        return False, f"Folder error: {folder_msg}"
 
-    file_name = os.path.basename(file_path)
+        return False, (
+            f"Folder error: {folder_msg}"
+        )
+
+    file_name = os.path.basename(
+        file_path
+    )
+
+    encoded_folder = quote(
+        folder_name,
+        safe=""
+    )
+
+    encoded_file = quote(
+        file_name,
+        safe=""
+    )
+
+    drive_url = get_onedrive_drive_url()
+
+    # --------------------------------------------------------
+    # CREATE UPLOAD SESSION
+    # --------------------------------------------------------
 
     session_url = (
-        "https://graph.microsoft.com/v1.0/"
-        f"me/drive/root:/{folder_name}/{file_name}:"
+        f"{drive_url}/root:/"
+        f"{encoded_folder}/"
+        f"{encoded_file}:"
         "/createUploadSession"
     )
 
@@ -297,53 +348,102 @@ def upload_large_file_to_onedrive(
         )
 
     except Exception as e:
-        return False, str(e)
-
-    if response.status_code not in [200, 201]:
 
         return False, (
-            f"Upload session create nahi hua: "
-            f"{response.status_code} - {response.text}"
+            f"Upload session error: {e}"
         )
 
-    upload_url = response.json().get("uploadUrl")
+    if response.status_code not in [
+        200,
+        201
+    ]:
+
+        return False, (
+            "Upload session create nahi hua: "
+            f"{response.status_code} - "
+            f"{response.text}"
+        )
+
+    try:
+
+        upload_url = response.json().get(
+            "uploadUrl"
+        )
+
+    except Exception:
+
+        upload_url = None
 
     if not upload_url:
-        return False, "Upload URL nahi mila."
 
-    file_size = os.path.getsize(file_path)
+        return False, (
+            "Upload URL nahi mila."
+        )
 
-    # 5 MB — 320 KiB ka exact multiple
+    # --------------------------------------------------------
+    # FILE SIZE
+    # --------------------------------------------------------
+
+    file_size = os.path.getsize(
+        file_path
+    )
+
+    # 5 MiB
+    # 5 MiB = 16 x 320 KiB
     chunk_size = 5 * 1024 * 1024
 
     start = 0
 
+    # --------------------------------------------------------
+    # UPLOAD CHUNKS
+    # --------------------------------------------------------
+
     try:
 
-        with open(file_path, "rb") as f:
+        with open(
+            file_path,
+            "rb"
+        ) as f:
 
             while start < file_size:
 
                 f.seek(start)
 
-                chunk = f.read(chunk_size)
+                chunk = f.read(
+                    chunk_size
+                )
 
                 if not chunk:
+
                     break
 
-                end = start + len(chunk) - 1
+                end = (
+                    start
+                    + len(chunk)
+                    - 1
+                )
 
                 upload_headers = {
-                    "Content-Length": str(len(chunk)),
+
+                    "Content-Length":
+                        str(len(chunk)),
+
                     "Content-Range":
-                        f"bytes {start}-{end}/{file_size}"
+                        (
+                            f"bytes "
+                            f"{start}-{end}/"
+                            f"{file_size}"
+                        )
+
                 }
 
-                upload_response = requests.put(
-                    upload_url,
-                    headers=upload_headers,
-                    data=chunk,
-                    timeout=120
+                upload_response = (
+                    requests.put(
+                        upload_url,
+                        headers=upload_headers,
+                        data=chunk,
+                        timeout=180
+                    )
                 )
 
                 if upload_response.status_code not in [
@@ -362,7 +462,9 @@ def upload_large_file_to_onedrive(
 
     except Exception as e:
 
-        return False, f"Upload exception: {e}"
+        return False, (
+            f"Upload exception: {e}"
+        )
 
     return True, "Upload successful"
 
@@ -392,11 +494,20 @@ def get_video_duration(video_path):
     )
 
     if not match:
+
         return 0
 
-    hours = int(match.group(1))
-    minutes = int(match.group(2))
-    seconds = float(match.group(3))
+    hours = int(
+        match.group(1)
+    )
+
+    minutes = int(
+        match.group(2)
+    )
+
+    seconds = float(
+        match.group(3)
+    )
 
     return (
         hours * 3600
@@ -422,16 +533,22 @@ def split_video(
         exist_ok=True
     )
 
-    duration = get_video_duration(video_path)
+    duration = get_video_duration(
+        video_path
+    )
 
     if duration <= 0:
+
         raise Exception(
             "Video duration read nahi ho paayi."
         )
 
-    total_clips = int(duration // clip_duration)
+    total_clips = int(
+        duration // clip_duration
+    )
 
     if duration % clip_duration > 0:
+
         total_clips += 1
 
     clips = []
@@ -472,7 +589,6 @@ def split_video(
             "crop=1080:1920"
         )
 
-
     safe_watermark = ""
 
     if watermark_text:
@@ -483,11 +599,9 @@ def split_video(
             .replace(":", "")
         )
 
-
     progress_bar = st.progress(0)
 
     status_text = st.empty()
-
 
     # --------------------------------------------------------
     # SPLIT LOOP
@@ -495,7 +609,9 @@ def split_video(
 
     for i in range(total_clips):
 
-        start_time = i * clip_duration
+        start_time = (
+            i * clip_duration
+        )
 
         output_file = os.path.join(
             output_dir,
@@ -505,7 +621,6 @@ def split_video(
         part_text = (
             f"Part {i + 1}/{total_clips}"
         )
-
 
         filters = [
 
@@ -522,7 +637,6 @@ def split_video(
             )
 
         ]
-
 
         if safe_watermark:
 
@@ -542,13 +656,11 @@ def split_video(
 
             )
 
-
         final_filter = (
             vf_scale
             + ","
             + ",".join(filters)
         )
-
 
         cmd = [
 
@@ -590,14 +702,12 @@ def split_video(
 
         ]
 
-
         result = subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
-
 
         if result.returncode != 0:
 
@@ -606,21 +716,22 @@ def split_video(
                 + result.stderr[-3000:]
             )
 
+        if os.path.exists(
+            output_file
+        ):
 
-        if os.path.exists(output_file):
-            clips.append(output_file)
-
+            clips.append(
+                output_file
+            )
 
         progress_bar.progress(
             (i + 1) / total_clips
         )
 
-
         status_text.text(
             f"⚡ Processing Clip "
             f"{i + 1}/{total_clips}"
         )
-
 
     status_text.text(
         "✅ Video processing complete!"
@@ -674,8 +785,7 @@ with st.sidebar:
     )
 
     # --------------------------------------------------------
-    # Use Streamlit Secrets if available
-    # Otherwise user can enter manually
+    # STREAMLIT SECRETS
     # --------------------------------------------------------
 
     try:
@@ -701,7 +811,6 @@ with st.sidebar:
         default_tenant_id = ""
         default_client_secret = ""
 
-
     client_id = st.text_input(
         "Azure Client ID",
         value=default_client_id
@@ -718,42 +827,30 @@ with st.sidebar:
         type="password"
     )
 
-
     st.markdown("---")
-
 
     st.markdown(
         "## 📘 Facebook Post Settings"
     )
 
-
     fb_page_id = st.text_input(
         "Facebook Page ID"
     )
 
-
     fb_post_type = st.selectbox(
-
         "Post Type",
-
         [
             "Facebook Reel (Short)",
             "Normal Page Video Post"
         ]
-
     )
 
-
     default_caption = st.text_area(
-
         "Default Caption",
-
         value=(
             "Check out this amazing clip! 🔥"
         )
-
     )
-
 
     st.info(
         "Facebook Access Token ab OneDrive metadata "
@@ -761,65 +858,47 @@ with st.sidebar:
         "GitHub Secrets mein rakhenge."
     )
 
-
     st.markdown("---")
-
 
     st.markdown(
         "## 🎛️ Video Settings"
     )
 
-
     uploaded_file = st.file_uploader(
-
         "📁 Upload Video",
-
         type=[
             "mp4",
             "mov",
             "avi",
             "mkv"
         ]
-
     )
 
-
     clip_duration = st.slider(
-
         "Clip Duration (Seconds)",
-
         min_value=15,
         max_value=120,
         value=60,
         step=15
-
     )
 
-
     aspect_ratio = st.selectbox(
-
         "Output Format",
-
         [
             "9:16 (Vertical / Reels)",
             "16:9 (Landscape)",
             "1:1 (Square)"
         ]
-
     )
 
-
     watermark_text = st.text_input(
-
         "🏷️ Watermark",
-
         placeholder="@YourPage"
-
     )
 
 
 # ============================================================
-# ONEDRIVE LOGIN
+# ONEDRIVE APPLICATION CONNECTION
 # ============================================================
 
 if (
@@ -832,236 +911,66 @@ if (
         "### ☁️ OneDrive Connection"
     )
 
+    # --------------------------------------------------------
+    # GET APP-ONLY TOKEN
+    # --------------------------------------------------------
+
     try:
-
-        msal_app = get_msal_app(
-            client_id,
-            tenant_id,
-            client_secret
-        )
-
-
-        # ----------------------------------------------------
-        # TRY SAVED REFRESH TOKEN
-        # ----------------------------------------------------
-
-        saved_token = load_refresh_token()
-
-
-        if (
-            not st.session_state.onedrive_access_token
-            and saved_token
-        ):
-
-            with st.spinner(
-                "Connecting to saved Microsoft session..."
-            ):
-
-                result = (
-                    msal_app.acquire_token_by_refresh_token(
-                        saved_token,
-                        scopes=SCOPES
-                    )
-                )
-
-
-            if "access_token" in result:
-
-                st.session_state.onedrive_access_token = (
-                    result["access_token"]
-                )
-
-                new_refresh_token = result.get(
-                    "refresh_token",
-                    saved_token
-                )
-
-                st.session_state.onedrive_refresh_token = (
-                    new_refresh_token
-                )
-
-                save_refresh_token(
-                    new_refresh_token
-                )
-
-
-        # ----------------------------------------------------
-        # FIRST LOGIN
-        # ----------------------------------------------------
 
         if not st.session_state.onedrive_access_token:
 
-            st.warning(
-                "⚠️ OneDrive abhi connected nahi hai."
-            )
-
-
-            auth_url = (
-                msal_app
-                .get_authorization_request_url(
-                    scopes=SCOPES,
-                    redirect_uri=REDIRECT_URI
-                )
-            )
-
-
-            st.markdown(
-                f"### [🔗 Microsoft / OneDrive Login]"
-                f"({auth_url})"
-            )
-
-
-            st.info(
-                "Login complete hone ke baad browser "
-                "`http://localhost/?code=...` par jayega. "
-                "Address bar ka poora URL copy karke niche paste karein."
-            )
-
-
-            redirected_url = st.text_input(
-
-                "Microsoft redirect URL paste karein",
-
-                placeholder=(
-                    "http://localhost/?code=..."
-                )
-
-            )
-
-
-            if st.button(
-                "🔐 Verify & Connect OneDrive",
-                type="primary"
+            with st.spinner(
+                "Connecting to OneDrive..."
             ):
 
-                if not redirected_url:
-
-                    st.error(
-                        "Redirect URL paste karein."
+                token = (
+                    get_application_access_token(
+                        client_id,
+                        tenant_id,
+                        client_secret
                     )
-
-                else:
-
-                    try:
-
-                        parsed_url = urlparse(
-                            redirected_url
-                        )
-
-                        query = parse_qs(
-                            parsed_url.query
-                        )
-
-
-                        if "code" not in query:
-
-                            st.error(
-                                "URL mein authorization code "
-                                "nahi mila."
-                            )
-
-                        else:
-
-                            authorization_code = (
-                                query["code"][0]
-                            )
-
-
-                            result = (
-                                msal_app
-                                .acquire_token_by_authorization_code(
-
-                                    authorization_code,
-
-                                    scopes=SCOPES,
-
-                                    redirect_uri=REDIRECT_URI
-
-                                )
-                            )
-
-
-                            if "access_token" in result:
-
-                                st.session_state.onedrive_access_token = (
-                                    result["access_token"]
-                                )
-
-
-                                refresh_token = result.get(
-                                    "refresh_token"
-                                )
-
-
-                                st.session_state.onedrive_refresh_token = (
-                                    refresh_token
-                                )
-
-
-                                if refresh_token:
-
-                                    save_refresh_token(
-                                        refresh_token
-                                    )
-
-
-                                st.success(
-                                    "✅ OneDrive connected successfully!"
-                                )
-
-
-                                st.rerun()
-
-
-                            else:
-
-                                st.error(
-                                    "Microsoft Login Failed:\n\n"
-                                    + result.get(
-                                        "error_description",
-                                        str(result)
-                                    )
-                                )
-
-
-                    except Exception as e:
-
-                        st.error(
-                            f"Authentication Error: {e}"
-                        )
-
-
-        else:
-
-            col1, col2 = st.columns(
-                [3, 1]
-            )
-
-
-            with col1:
-
-                st.success(
-                    "✅ OneDrive Connected"
                 )
 
+                st.session_state.onedrive_access_token = (
+                    token
+                )
 
-            with col2:
+        st.success(
+            "✅ OneDrive Connected"
+        )
 
-                if st.button(
-                    "Disconnect"
-                ):
+        st.caption(
+            f"Target OneDrive: {ONEDRIVE_USER}"
+        )
 
-                    delete_saved_token()
+        st.caption(
+            "Authentication: Microsoft Graph "
+            "Application Permission"
+        )
 
-                    st.rerun()
+        # ----------------------------------------------------
+        # DISCONNECT
+        # ----------------------------------------------------
 
+        if st.button(
+            "Disconnect"
+        ):
+
+            st.session_state.onedrive_access_token = None
+
+            st.rerun()
 
     except Exception as e:
 
+        st.session_state.onedrive_access_token = None
+
         st.error(
-            f"Microsoft configuration error: {e}"
+            "❌ Microsoft / OneDrive connection failed."
         )
 
+        st.code(
+            str(e)
+        )
 
 else:
 
@@ -1082,29 +991,19 @@ if uploaded_file is not None:
         exist_ok=True
     )
 
-
     temp_input_path = os.path.join(
-
         "/tmp/uploads",
-
         uploaded_file.name
-
     )
 
-
     file_changed = (
-
         st.session_state.input_file
         != temp_input_path
-
         or
-
         not os.path.exists(
             temp_input_path
         )
-
     )
-
 
     if file_changed:
 
@@ -1117,18 +1016,15 @@ if uploaded_file is not None:
                 uploaded_file.getbuffer()
             )
 
-
         st.session_state.input_file = (
             temp_input_path
         )
-
 
         st.session_state.duration = (
             get_video_duration(
                 temp_input_path
             )
         )
-
 
         st.session_state.clips = []
 
@@ -1138,20 +1034,15 @@ if uploaded_file is not None:
 # ============================================================
 
 if (
-
     st.session_state.input_file
-
     and os.path.exists(
         st.session_state.input_file
     )
-
 ):
 
     st.markdown("---")
 
-
     col1, col2, col3 = st.columns(3)
-
 
     with col1:
 
@@ -1162,7 +1053,6 @@ if (
             )
         )
 
-
     with col2:
 
         st.metric(
@@ -1170,14 +1060,10 @@ if (
             f"{st.session_state.duration:.1f} sec"
         )
 
-
     estimated_clips = int(
-
         st.session_state.duration
         // clip_duration
-
     )
-
 
     if (
         st.session_state.duration
@@ -1186,7 +1072,6 @@ if (
 
         estimated_clips += 1
 
-
     with col3:
 
         st.metric(
@@ -1194,11 +1079,9 @@ if (
             estimated_clips
         )
 
-
     st.markdown(
         "## 🚀 Render Workspace"
     )
-
 
     if not st.session_state.onedrive_access_token:
 
@@ -1206,7 +1089,6 @@ if (
             "Video split karne se pehle "
             "OneDrive connect karein."
         )
-
 
     else:
 
@@ -1220,7 +1102,6 @@ if (
                 "/tmp/reels"
             )
 
-
             if os.path.exists(
                 output_dir
             ):
@@ -1229,12 +1110,10 @@ if (
                     output_dir
                 )
 
-
             os.makedirs(
                 output_dir,
                 exist_ok=True
             )
-
 
             try:
 
@@ -1243,28 +1122,19 @@ if (
                 ):
 
                     st.session_state.clips = (
-
                         split_video(
-
                             st.session_state.input_file,
-
                             output_dir,
-
                             clip_duration,
-
                             aspect_ratio,
-
                             watermark_text
-
                         )
-
                     )
 
-
                 st.success(
-                    f"✅ {len(st.session_state.clips)} clips generated!"
+                    f"✅ {len(st.session_state.clips)} "
+                    f"clips generated!"
                 )
-
 
             except Exception as e:
 
@@ -1289,9 +1159,7 @@ if st.session_state.clips:
         "## 📦 Generated Clips"
     )
 
-
     clip_columns = st.columns(2)
-
 
     for index, clip in enumerate(
         st.session_state.clips
@@ -1315,21 +1183,15 @@ if st.session_state.clips:
             ) as f:
 
                 st.download_button(
-
                     label=(
                         f"⬇️ Download Part {index + 1}"
                     ),
-
                     data=f.read(),
-
                     file_name=os.path.basename(
                         clip
                     ),
-
                     mime="video/mp4",
-
                     key=f"download_{index}"
-
                 )
 
 
@@ -1338,35 +1200,25 @@ if st.session_state.clips:
 # ============================================================
 
 if (
-
     st.session_state.clips
-
     and st.session_state.onedrive_access_token
-
 ):
 
     st.markdown("---")
 
-
     st.markdown(
         "## ☁️ Send to Background Automation"
     )
-
 
     st.write(
         "Clips OneDrive ke `Pending_Posts` folder "
         "mein upload hongi."
     )
 
-
     if st.button(
-
         "☁️ Upload All Clips to OneDrive",
-
         type="primary",
-
         use_container_width=True
-
     ):
 
         if not fb_page_id:
@@ -1374,7 +1226,6 @@ if (
             st.error(
                 "Facebook Page ID enter karein."
             )
-
 
         else:
 
@@ -1385,46 +1236,32 @@ if (
                 + 1
             )
 
-
             progress = st.progress(0)
 
             status = st.empty()
 
             upload_failed = False
 
-
             # ------------------------------------------------
             # UPLOAD CLIPS
             # ------------------------------------------------
 
             for index, clip in enumerate(
-
                 st.session_state.clips
-
             ):
 
                 status.text(
-
                     f"☁️ Uploading "
                     f"{os.path.basename(clip)}..."
-
                 )
-
 
                 success, message = (
-
                     upload_large_file_to_onedrive(
-
                         clip,
-
                         st.session_state.onedrive_access_token,
-
                         "Pending_Posts"
-
                     )
-
                 )
-
 
                 if not success:
 
@@ -1435,14 +1272,10 @@ if (
 
                     upload_failed = True
 
-
                 progress.progress(
-
                     (index + 1)
                     / total_items
-
                 )
-
 
             # ------------------------------------------------
             # METADATA
@@ -1471,57 +1304,36 @@ if (
 
                 }
 
-
                 metadata_path = (
                     "/tmp/metadata.json"
                 )
 
-
                 with open(
-
                     metadata_path,
-
                     "w",
-
                     encoding="utf-8"
-
                 ) as f:
 
                     json.dump(
-
                         metadata,
-
                         f,
-
                         indent=4,
-
                         ensure_ascii=False
-
                     )
-
 
                 status.text(
                     "☁️ Uploading metadata.json..."
                 )
 
-
                 meta_success, meta_message = (
-
                     upload_large_file_to_onedrive(
-
                         metadata_path,
-
                         st.session_state.onedrive_access_token,
-
                         "Pending_Posts"
-
                     )
-
                 )
 
-
                 progress.progress(1.0)
-
 
                 if meta_success:
 
@@ -1533,13 +1345,11 @@ if (
                         "folder mein ready hain."
                     )
 
-
                     st.info(
                         "Ab next phase mein GitHub Actions "
                         "in clips ko automatically Facebook "
                         "par post karega."
                     )
-
 
                 else:
 
@@ -1548,6 +1358,10 @@ if (
                         f"{meta_message}"
                     )
 
+
+# ============================================================
+# NO VIDEO STATE
+# ============================================================
 
 else:
 
