@@ -1,4 +1,4 @@
-name: OneDrive Connection Test
+name: OneDrive Upload Test
 
 on:
   workflow_dispatch:
@@ -8,20 +8,45 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Test Azure credentials
+      - name: Get Microsoft Graph token
+        id: token
         env:
-          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: |
-          echo "Azure credentials loaded successfully"
-          echo "Tenant ID length: ${#AZURE_TENANT_ID}"
-          echo "Client ID length: ${#AZURE_CLIENT_ID}"
-          echo "Client Secret length: ${#AZURE_CLIENT_SECRET}"
+          RESPONSE=$(curl -s -X POST \
+            "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+            -H "Content-Type: application/x-www-form-urlencoded" \
+            --data-urlencode "client_id=${CLIENT_ID}" \
+            --data-urlencode "client_secret=${CLIENT_SECRET}" \
+            --data-urlencode "scope=https://graph.microsoft.com/.default" \
+            --data-urlencode "grant_type=client_credentials")
 
-          if [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ]; then
-            echo "ERROR: One or more Azure secrets are missing."
+          echo "$RESPONSE" > token_response.json
+
+          if ! grep -q '"access_token"' token_response.json; then
+            echo "ERROR: Microsoft Graph token could not be obtained."
+            cat token_response.json
             exit 1
           fi
 
-          echo "All three Azure secrets are available."
+          TOKEN=$(python -c "import json; print(json.load(open('token_response.json'))['access_token'])")
+          echo "GRAPH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+
+          echo "Microsoft Graph token obtained successfully."
+
+      - name: Find Pending_Posts folder
+        run: |
+          RESPONSE=$(curl -s \
+            -H "Authorization: Bearer $GRAPH_TOKEN" \
+            "https://graph.microsoft.com/v1.0/users/${{ secrets.ONEDRIVE_USER_ID }}/drive/root:/Pending_Posts")
+
+          echo "$RESPONSE"
+
+          if echo "$RESPONSE" | grep -q '"id"'; then
+            echo "Pending_Posts folder found."
+          else
+            echo "ERROR: Pending_Posts folder not found."
+            exit 1
+          fi
