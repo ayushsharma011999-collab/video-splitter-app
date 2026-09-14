@@ -147,13 +147,15 @@ def delete_saved_token():
 # MICROSOFT / ONEDRIVE CONFIG
 # ============================================================
 
-SCOPES = [
-    "Files.ReadWrite.All",
-    
-]
+# ============================================================
+# MICROSOFT / ONEDRIVE CONFIG
+# ============================================================
 
-REDIRECT_URI = "http://localhost"
+ONEDRIVE_USER = "my@011999.onmicrosoft.com"
 
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 def get_msal_app(client_id, tenant_id, client_secret):
 
