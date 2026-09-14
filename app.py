@@ -4,14 +4,14 @@ import subprocess
 import zipfile
 import requests
 import streamlit as st
-
+import re
 
 # =========================
 # CONFIG
 # =========================
 
 st.set_page_config(
-    page_title="Video Splitter",
+    page_title="Advanced Video Splitter",
     page_icon="🎬",
     layout="centered"
 )
@@ -29,28 +29,11 @@ if not FFMPEG:
 # =========================
 
 def get_video_duration(video_path):
-    cmd = [
-        FFMPEG,
-        "-i",
-        video_path
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
+    cmd = [FFMPEG, "-i", video_path]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     output = result.stderr
 
-    import re
-
-    match = re.search(
-        r"Duration:\s*(\d+):(\d+):([\d.]+)",
-        output
-    )
-
+    match = re.search(r"Duration:\s*(\d+):(\d+):([\d.]+)", output)
     if not match:
         return 0
 
@@ -61,128 +44,101 @@ def get_video_duration(video_path):
     return hours * 3600 + minutes * 60 + seconds
 
 
-def split_video(video_path, output_dir, clip_duration=60):
-
+def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", watermark_text=""):
     os.makedirs(output_dir, exist_ok=True)
-
     duration = get_video_duration(video_path)
 
     if duration <= 0:
         raise Exception("Video duration read nahi ho paayi.")
 
     total_clips = int(duration // clip_duration)
-
     if duration % clip_duration > 0:
         total_clips += 1
 
     clips = []
+    
+    # Aspect Ratio Filter mapping
+    if aspect_ratio == "9:16 (Vertical / Reels)":
+        vf_scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+    elif aspect_ratio == "16:9 (Horizontal / YouTube)":
+        vf_scale = "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080"
+    elif aspect_ratio == "1:1 (Square / Post)":
+        vf_scale = "scale=1080:1080:force_original_aspect_ratio=increase,crop=1080:1080"
+    else:
+        vf_scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
+
+    # Watermark Filter logic
+    if watermark_text.strip():
+        # Escape special characters for ffmpeg drawtext filter if needed, keeping basic safety
+        safe_text = watermark_text.replace("'", "").replace(":", "")
+        # Adds text at bottom-right corner with semi-transparent background box
+        watermark_filter = f",drawtext=text='{safe_text}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.5:boxborderw=10:x=w-tw-50:y=h-th-50"
+    else:
+        watermark_filter = ""
+
+    final_vf = vf_scale + watermark_filter
+
+    # Progress bar setup
+    progress_bar = st.progress(0)
+    status_text = st.empty()
 
     for i in range(total_clips):
-
         start = i * clip_duration
-
-        output_file = os.path.join(
-            output_dir,
-            f"Reel_Part_{i + 1}.mp4"
-        )
+        output_file = os.path.join(output_dir, f"Clip_Part_{i + 1}.mp4")
 
         cmd = [
             FFMPEG,
             "-y",
-            "-ss",
-            str(start),
-            "-i",
-            video_path,
-            "-t",
-            str(clip_duration),
-
-            # 9:16 vertical video
-            "-vf",
-            "scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920",
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "veryfast",
-
-            "-crf",
-            "23",
-
-            "-c:a",
-            "aac",
-
-            "-b:a",
-            "128k",
-
-            "-movflags",
-            "+faststart",
-
+            "-ss", str(start),
+            "-i", video_path,
+            "-t", str(clip_duration),
+            "-vf", final_vf,
+            "-c:v", "libx264",
+            "-preset", "veryfast",
+            "-crf", "23",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-movflags", "+faststart",
             output_file
         ]
 
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
+        result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         if result.returncode != 0:
-            raise Exception(
-                "FFmpeg error:\n\n" + result.stderr[-3000:]
-            )
+            raise Exception("FFmpeg error:\n\n" + result.stderr[-3000:])
 
         if os.path.exists(output_file):
             clips.append(output_file)
 
+        # Update progress bar
+        progress_percentage = (i + 1) / total_clips
+        progress_bar.progress(progress_percentage)
+        status_text.text(f"Processing clip {i + 1} of {total_clips}...")
+
+    status_text.text("Processing complete! 🎉")
     return clips
 
 
 def create_zip(files, zip_name):
-
-    with zipfile.ZipFile(
-        zip_name,
-        "w",
-        zipfile.ZIP_DEFLATED
-    ) as zip_file:
-
+    with zipfile.ZipFile(zip_name, "w", zipfile.ZIP_DEFLATED) as zip_file:
         for file in files:
-            zip_file.write(
-                file,
-                os.path.basename(file)
-            )
+            zip_file.write(file, os.path.basename(file))
 
 
 # =========================
 # UI
 # =========================
 
-st.title("🎬 Video Splitter")
-
-st.write(
-    "Upload video aur usko automatic 9:16 vertical clips mein split karein."
-)
-
+st.title("🎬 Advanced Video Splitter")
+st.write("Video upload karein, aspect ratio select karein, watermark dalein aur automatic clips banayein!")
 
 uploaded_file = st.file_uploader(
     "Video upload karein",
-    type=[
-        "mp4",
-        "mov",
-        "avi",
-        "mkv"
-    ]
+    type=["mp4", "mov", "avi", "mkv"]
 )
 
-
 if uploaded_file:
-
-    input_file = os.path.join(
-        "/tmp",
-        uploaded_file.name
-    )
+    input_file = os.path.join("/tmp", uploaded_file.name)
 
     with open(input_file, "wb") as f:
         f.write(uploaded_file.getbuffer())
@@ -192,23 +148,39 @@ if uploaded_file:
     duration = get_video_duration(input_file)
 
     if duration > 0:
-        st.info(
-            f"Video duration: {duration:.1f} seconds"
+        st.info(f"Video duration: {duration:.1f} seconds")
+
+    # Sidebar / Options Section
+    st.markdown("### ⚙️ Customization Settings")
+    
+    col1, col2 = st.columns(2)
+
+    with col1:
+        clip_duration = st.number_input(
+            "Har clip kitne seconds ki ho?",
+            min_value=10,
+            max_value=180,
+            value=60,
+            step=10
         )
 
-    clip_duration = st.number_input(
-        "Har clip kitne seconds ka ho?",
-        min_value=10,
-        max_value=180,
-        value=60,
-        step=10
+    with col2:
+        aspect_ratio = st.selectbox(
+            "Video Aspect Ratio Select Karein",
+            [
+                "9:16 (Vertical / Reels)",
+                "16:9 (Horizontal / YouTube)",
+                "1:1 (Square / Post)"
+            ]
+        )
+
+    watermark_text = st.text_input(
+        "🏷️ Custom Watermark Text (Optional)",
+        placeholder="Jaise: @AapkaChannelName",
+        max_chars=30
     )
 
-    if st.button(
-        "🎬 Video Split Karein",
-        type="primary"
-    ):
-
+    if st.button("🎬 Video Split & Process Karein", type="primary"):
         output_dir = "/tmp/reels"
 
         # Remove old files
@@ -218,32 +190,24 @@ if uploaded_file:
         os.makedirs(output_dir)
 
         try:
-
-            with st.spinner(
-                "Video process ho raha hai..."
-            ):
-
-                clips = split_video(
-                    input_file,
-                    output_dir,
-                    clip_duration
-                )
+            clips = split_video(
+                input_file,
+                output_dir,
+                clip_duration,
+                aspect_ratio,
+                watermark_text
+            )
 
             if not clips:
                 st.error("Koi clip create nahi hui.")
                 st.stop()
 
-            st.success(
-                f"✅ {len(clips)} clips successfully create ho gayi!"
-            )
+            st.success(f"✅ {len(clips)} clips successfully create ho gayi!")
 
-            # Show clips
+            # Show clips & download buttons
             for clip in clips:
-
                 st.video(clip)
-
                 with open(clip, "rb") as f:
-
                     st.download_button(
                         label=f"⬇️ {os.path.basename(clip)}",
                         data=f.read(),
@@ -251,16 +215,11 @@ if uploaded_file:
                         mime="video/mp4"
                     )
 
-            # ZIP
+            # ZIP Download
             zip_file = "/tmp/reels.zip"
-
-            create_zip(
-                clips,
-                zip_file
-            )
+            create_zip(clips, zip_file)
 
             with open(zip_file, "rb") as f:
-
                 st.download_button(
                     label="📦 Download All Clips ZIP",
                     data=f.read(),
@@ -269,7 +228,5 @@ if uploaded_file:
                 )
 
         except Exception as e:
-
             st.error("❌ Video processing failed")
-
             st.code(str(e))
