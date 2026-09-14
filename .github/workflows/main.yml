@@ -1,10 +1,10 @@
-name: OneDrive Drive Test
+name: OneDrive Upload Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  test-drive:
+  upload-test:
     runs-on: ubuntu-latest
 
     steps:
@@ -26,25 +26,27 @@ jobs:
 
           if [ -z "$TOKEN" ]; then
             echo "ERROR: Could not get Graph token."
-            echo "$RESPONSE"
             exit 1
           fi
 
           echo "GRAPH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
           echo "Graph token obtained."
 
-      - name: Test OneDrive
+      - name: Upload test file to Pending_Posts
         run: |
-          curl -s \
+          echo "OneDrive Auto Poster connection test successful." > connection-test.txt
+
+          RESPONSE=$(curl -s -X PUT \
             -H "Authorization: Bearer $GRAPH_TOKEN" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive" \
-            -o drive.json
+            -H "Content-Type: text/plain" \
+            --data-binary @connection-test.txt \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts/connection-test.txt:/content")
 
-          cat drive.json
+          echo "$RESPONSE"
 
-          if grep -q '"id"' drive.json; then
-            echo "SUCCESS: OneDrive drive found."
+          if echo "$RESPONSE" | grep -q '"id"'; then
+            echo "SUCCESS: Test file uploaded to Pending_Posts."
           else
-            echo "ERROR: Could not access this user's OneDrive."
+            echo "ERROR: Upload failed."
             exit 1
           fi
