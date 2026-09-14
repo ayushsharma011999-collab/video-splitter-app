@@ -23,6 +23,14 @@ if not FFMPEG:
     st.error("FFmpeg install nahi hua. Please packages.txt check karein.")
     st.stop()
 
+# Initialize Session State variables to prevent reset on mobile refresh/reload
+if "input_file" not in st.session_state:
+    st.session_state.input_file = None
+if "clips" not in st.session_state:
+    st.session_state.clips = []
+if "duration" not in st.session_state:
+    st.session_state.duration = 0
+
 
 # =========================
 # FUNCTIONS
@@ -69,9 +77,7 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
 
     # Watermark Filter logic
     if watermark_text.strip():
-        # Escape special characters for ffmpeg drawtext filter if needed, keeping basic safety
         safe_text = watermark_text.replace("'", "").replace(":", "")
-        # Adds text at bottom-right corner with semi-transparent background box
         watermark_filter = f",drawtext=text='{safe_text}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.5:boxborderw=10:x=w-tw-50:y=h-th-50"
     else:
         watermark_filter = ""
@@ -137,18 +143,25 @@ uploaded_file = st.file_uploader(
     type=["mp4", "mov", "avi", "mkv"]
 )
 
-if uploaded_file:
-    input_file = os.path.join("/tmp", uploaded_file.name)
+# Handle file upload and store persistently in session state
+if uploaded_file is not None:
+    # Save only if it's a new file or not saved yet
+    temp_input_path = os.path.join("/tmp", uploaded_file.name)
+    
+    if st.session_state.input_file != temp_input_path:
+        with open(temp_input_path, "wb") as f:
+            f.write(uploaded_file.getbuffer())
+        
+        st.session_state.input_file = temp_input_path
+        st.session_state.duration = get_video_duration(temp_input_path)
+        st.session_state.clips = [] # Reset old clips on new file upload
 
-    with open(input_file, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-
+# If file exists in session (survives minor reloads if browser keeps tmp)
+if st.session_state.input_file and os.path.exists(st.session_state.input_file):
     st.success("Video upload ho gaya ✅")
 
-    duration = get_video_duration(input_file)
-
-    if duration > 0:
-        st.info(f"Video duration: {duration:.1f} seconds")
+    if st.session_state.duration > 0:
+        st.info(f"Video duration: {st.session_state.duration:.1f} seconds")
 
     # Sidebar / Options Section
     st.markdown("### ⚙️ Customization Settings")
@@ -190,43 +203,43 @@ if uploaded_file:
         os.makedirs(output_dir)
 
         try:
-            clips = split_video(
-                input_file,
+            st.session_state.clips = split_video(
+                st.session_state.input_file,
                 output_dir,
                 clip_duration,
                 aspect_ratio,
                 watermark_text
             )
+        except Exception as e:
+            st.error("❌ Video processing failed")
+            st.code(str(e))
 
-            if not clips:
-                st.error("Koi clip create nahi hui.")
-                st.stop()
+    # Display clips if already generated (saved in session)
+    if st.session_state.clips:
+        st.success(f"✅ {len(st.session_state.clips)} clips successfully create ho gayi!")
 
-            st.success(f"✅ {len(clips)} clips successfully create ho gayi!")
-
-            # Show clips & download buttons
-            for clip in clips:
+        for clip in st.session_state.clips:
+            if os.path.exists(clip):
                 st.video(clip)
                 with open(clip, "rb") as f:
                     st.download_button(
                         label=f"⬇️ {os.path.basename(clip)}",
                         data=f.read(),
                         file_name=os.path.basename(clip),
-                        mime="video/mp4"
+                        mime="video/mp4",
+                        key=f"dl_{os.path.basename(clip)}"
                     )
 
-            # ZIP Download
-            zip_file = "/tmp/reels.zip"
-            create_zip(clips, zip_file)
+        # ZIP Download
+        zip_file = "/tmp/reels.zip"
+        create_zip(st.session_state.clips, zip_file)
 
+        if os.path.exists(zip_file):
             with open(zip_file, "rb") as f:
                 st.download_button(
                     label="📦 Download All Clips ZIP",
                     data=f.read(),
                     file_name="reels.zip",
-                    mime="application/zip"
+                    mime="application/zip",
+                    key="dl_zip_all"
                 )
-
-        except Exception as e:
-            st.error("❌ Video processing failed")
-            st.code(str(e))
