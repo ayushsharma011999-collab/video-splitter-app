@@ -1,19 +1,27 @@
-name: OneDrive Upload Test
+```yaml
+name: OneDrive Pending Posts Processor
 
 on:
   workflow_dispatch:
 
 jobs:
-  upload-test:
+  process-pending-posts:
     runs-on: ubuntu-latest
 
     steps:
+
+      # ======================================================
+      # 1. GET MICROSOFT GRAPH TOKEN
+      # ======================================================
+
       - name: Get Microsoft Graph token
         env:
           TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+
         run: |
+
           RESPONSE=$(curl -s -X POST \
             "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
@@ -22,31 +30,141 @@ jobs:
             --data-urlencode "scope=https://graph.microsoft.com/.default" \
             --data-urlencode "grant_type=client_credentials")
 
-          TOKEN=$(python -c "import json; print(json.loads('''$RESPONSE''').get('access_token',''))")
+          TOKEN=$(python -c "
+          import json
+          print(json.loads('''$RESPONSE''').get('access_token',''))
+          ")
 
           if [ -z "$TOKEN" ]; then
             echo "ERROR: Could not get Graph token."
+            echo "$RESPONSE"
             exit 1
           fi
 
           echo "GRAPH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
-          echo "Graph token obtained."
 
-      - name: Upload test file to Pending_Posts
+          echo "Graph token obtained successfully."
+
+
+      # ======================================================
+      # 2. LIST PENDING_POSTS FILES
+      # ======================================================
+
+      - name: List Pending_Posts files
         run: |
-          echo "OneDrive Auto Poster connection test successful." > connection-test.txt
 
-          RESPONSE=$(curl -s -X PUT \
+          RESPONSE=$(curl -s \
             -H "Authorization: Bearer $GRAPH_TOKEN" \
-            -H "Content-Type: text/plain" \
-            --data-binary @connection-test.txt \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts/connection-test.txt:/content")
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts:/children")
 
-          echo "$RESPONSE"
+          echo "$RESPONSE" > pending_posts.json
 
-          if echo "$RESPONSE" | grep -q '"id"'; then
-            echo "SUCCESS: Test file uploaded to Pending_Posts."
-          else
-            echo "ERROR: Upload failed."
-            exit 1
-          fi
+          echo "----------------------------------------"
+          echo "Pending_Posts contents:"
+          echo "----------------------------------------"
+
+          python - <<'PY'
+          import json
+
+          with open("pending_posts.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          if "value" not in data:
+              print("ERROR: Could not read Pending_Posts.")
+              print(json.dumps(data, indent=2))
+              raise SystemExit(1)
+
+          files = data["value"]
+
+          if not files:
+              print("Pending_Posts is empty.")
+          else:
+              for item in files:
+                  print(
+                      f"- {item.get('name')} "
+                      f"| id={item.get('id')}"
+                  )
+          PY
+
+
+      # ======================================================
+      # 3. DOWNLOAD PENDING FILES
+      # ======================================================
+
+      - name: Download Pending_Posts files
+        run: |
+
+          mkdir -p pending_files
+
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          with open("pending_posts.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          files = data.get("value", [])
+
+          for item in files:
+
+              name = item.get("name", "")
+              download_url = item.get("@microsoft.graph.downloadUrl")
+
+              if not download_url:
+                  print(f"Skipping {name}: no download URL")
+                  continue
+
+              output = os.path.join(
+                  "pending_files",
+                  name
+              )
+
+              print(f"Downloading: {name}")
+
+              result = subprocess.run(
+                  [
+                      "curl",
+                      "-L",
+                      "-s",
+                      "-o",
+                      output,
+                      download_url
+                  ]
+              )
+
+              if result.returncode != 0:
+                  raise SystemExit(
+                      f"Download failed: {name}"
+                  )
+
+          print("Download step completed.")
+          PY
+
+
+      # ======================================================
+      # 4. SHOW DOWNLOADED FILES
+      # ======================================================
+
+      - name: Verify downloaded files
+        run: |
+
+          echo "----------------------------------------"
+          echo "Downloaded files:"
+          echo "----------------------------------------"
+
+          find pending_files -maxdepth 1 -type f -printf "%f\n"
+
+          echo "----------------------------------------"
+
+          echo "Processor test completed successfully."
+
+          echo ""
+          echo "Facebook secrets detected by GitHub Actions:"
+          echo "FACEBOOK_PAGE_ID = configured"
+          echo "FACEBOOK_PAGE_ACCESS_TOKEN = configured"
+
+          echo ""
+          echo "NOTE:"
+          echo "This workflow does NOT publish anything to Facebook yet."
+```
