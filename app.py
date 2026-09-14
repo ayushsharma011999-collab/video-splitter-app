@@ -1,17 +1,20 @@
+```python
 import os
 import json
-import re
-import shutil
+import math
+import time
+import tempfile
 import subprocess
+from pathlib import Path
 from urllib.parse import quote
 
 import requests
-import streamlit as st
 import msal
+import streamlit as st
 
 
 # ============================================================
-# STREAMLIT CONFIG
+# PAGE CONFIG
 # ============================================================
 
 st.set_page_config(
@@ -20,125 +23,125 @@ st.set_page_config(
     layout="wide"
 )
 
-st.markdown("""
-<style>
 
-.main {
-    background-color: #0e1117;
-}
+# ============================================================
+# CONSTANTS
+# ============================================================
 
-.dashboard-card {
-    background-color: #161b22;
-    border: 1px solid #30363d;
-    padding: 20px;
-    border-radius: 12px;
-    margin-bottom: 20px;
-}
+ONEDRIVE_USER = "my@011999.onmicrosoft.com"
 
-.status-box {
-    background-color: #161b22;
-    border: 1px solid #30363d;
-    padding: 15px;
-    border-radius: 10px;
-    margin-bottom: 15px;
-}
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
-.metric-value {
-    font-size: 24px;
-    font-weight: bold;
-    color: #58a6ff;
-}
+ONEDRIVE_FOLDER = "Pending_Posts"
 
-.stButton button {
-    width: 100%;
-    border-radius: 8px;
-    font-weight: 600;
-}
+# 5 MiB = exact multiple of 320 KiB
+CHUNK_SIZE = 5 * 1024 * 1024
 
-</style>
-""", unsafe_allow_html=True)
+MAX_STREAMLIT_UPLOAD_SIZE_MB = 2048
 
 
 # ============================================================
-# FFMPEG
+# CUSTOM CSS
 # ============================================================
 
-FFMPEG = shutil.which("ffmpeg")
+st.markdown(
+    """
+    <style>
 
-if not FFMPEG:
-    st.error(
-        "❌ FFmpeg nahi mila. GitHub repository mein "
-        "`packages.txt` file check karein."
-    )
-    st.stop()
+    .main-title {
+        font-size: 34px;
+        font-weight: 700;
+        margin-bottom: 5px;
+    }
+
+    .sub-title {
+        font-size: 16px;
+        opacity: 0.75;
+        margin-bottom: 25px;
+    }
+
+    .status-box {
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
+
+
+# ============================================================
+# HEADER
+# ============================================================
+
+st.markdown(
+    '<div class="main-title">🎬 Pro Video Studio</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="sub-title">Video Splitter + OneDrive Pending Posts</div>',
+    unsafe_allow_html=True
+)
 
 
 # ============================================================
 # SESSION STATE
 # ============================================================
 
-if "input_file" not in st.session_state:
-    st.session_state.input_file = None
-
-if "clips" not in st.session_state:
-    st.session_state.clips = []
-
-if "duration" not in st.session_state:
-    st.session_state.duration = 0
-
 if "onedrive_access_token" not in st.session_state:
     st.session_state.onedrive_access_token = None
 
+if "onedrive_drive_id" not in st.session_state:
+    st.session_state.onedrive_drive_id = None
 
-# ============================================================
-# MICROSOFT / ONEDRIVE CONFIG
-# ============================================================
-
-ONEDRIVE_USER = "my@011999.onmicrosoft.com"
-
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
-
-GRAPH_SCOPE = "https://graph.microsoft.com/.default"
+if "onedrive_connected" not in st.session_state:
+    st.session_state.onedrive_connected = False
 
 
 # ============================================================
-# MICROSOFT APP
+# AZURE / MICROSOFT GRAPH AUTHENTICATION
 # ============================================================
 
-def get_msal_app(client_id, tenant_id, client_secret):
+def get_application_access_token():
+    """
+    Gets Microsoft Graph application token using
+    credentials stored in Streamlit Secrets.
+    """
+
+    try:
+        client_id = st.secrets["AZURE_CLIENT_ID"]
+        tenant_id = st.secrets["AZURE_TENANT_ID"]
+        client_secret = st.secrets["AZURE_CLIENT_SECRET"]
+
+    except Exception:
+        st.error(
+            """
+            ❌ Azure credentials Streamlit Secrets me configured nahi hain.
+
+            Required secrets:
+
+            - AZURE_CLIENT_ID
+            - AZURE_TENANT_ID
+            - AZURE_CLIENT_SECRET
+            """
+        )
+        st.stop()
 
     authority = (
         f"https://login.microsoftonline.com/{tenant_id}"
     )
 
-    return msal.ConfidentialClientApplication(
+    confidential_app = msal.ConfidentialClientApplication(
         client_id=client_id,
         authority=authority,
         client_credential=client_secret
     )
 
-
-# ============================================================
-# APPLICATION ACCESS TOKEN
-# ============================================================
-
-def get_application_access_token(
-    client_id,
-    tenant_id,
-    client_secret
-):
-
-    authority = (
-        f"https://login.microsoftonline.com/{tenant_id}"
-    )
-
-    app = msal.ConfidentialClientApplication(
-        client_id=client_id,
-        authority=authority,
-        client_credential=client_secret
-    )
-
-    result = app.acquire_token_for_client(
+    result = confidential_app.acquire_token_for_client(
         scopes=[GRAPH_SCOPE]
     )
 
@@ -150,161 +153,156 @@ def get_application_access_token(
         )
 
         raise Exception(
-            error_description
+            "Microsoft Graph authentication failed:\n"
+            + error_description
         )
 
     return result["access_token"]
 
 
 # ============================================================
-# ONEDRIVE DRIVE BASE URL
+# GRAPH REQUEST HELPER
 # ============================================================
 
-def get_onedrive_drive_url():
-
-    encoded_user = quote(
-        ONEDRIVE_USER,
-        safe=""
-    )
-
-    return (
-        f"{GRAPH_BASE_URL}/users/"
-        f"{encoded_user}/drive"
-    )
-
-
-# ============================================================
-# CREATE / CHECK ONEDRIVE FOLDER
-# ============================================================
-
-def ensure_onedrive_folder(
-    access_token,
-    folder_name
-):
-
-    headers = {
+def graph_headers(access_token):
+    return {
         "Authorization": f"Bearer {access_token}"
     }
 
-    encoded_folder = quote(
-        folder_name,
+
+# ============================================================
+# GET ONEDRIVE DRIVE
+# ============================================================
+
+def get_onedrive_drive(access_token):
+
+    url = (
+        f"{GRAPH_BASE_URL}"
+        f"/users/{quote(ONEDRIVE_USER, safe='')}"
+        f"/drive"
+    )
+
+    response = requests.get(
+        url,
+        headers=graph_headers(access_token),
+        timeout=60
+    )
+
+    if response.status_code != 200:
+
+        raise Exception(
+            f"OneDrive drive access failed.\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# GET DRIVE ID
+# ============================================================
+
+def get_onedrive_drive_id(access_token):
+
+    if st.session_state.onedrive_drive_id:
+        return st.session_state.onedrive_drive_id
+
+    drive = get_onedrive_drive(access_token)
+
+    drive_id = drive.get("id")
+
+    if not drive_id:
+        raise Exception(
+            "OneDrive Drive ID nahi mila."
+        )
+
+    st.session_state.onedrive_drive_id = drive_id
+
+    return drive_id
+
+
+# ============================================================
+# CHECK / CREATE FOLDER
+# ============================================================
+
+def ensure_pending_posts_folder(access_token):
+
+    folder_path = quote(
+        ONEDRIVE_FOLDER,
         safe=""
     )
 
-    drive_url = get_onedrive_drive_url()
-
-    # --------------------------------------------------------
-    # CHECK FOLDER
-    # --------------------------------------------------------
-
-    check_url = (
-        f"{drive_url}/root:/"
-        f"{encoded_folder}"
+    url = (
+        f"{GRAPH_BASE_URL}"
+        f"/users/{quote(ONEDRIVE_USER, safe='')}"
+        f"/drive/root:/{folder_path}"
     )
 
-    try:
+    response = requests.get(
+        url,
+        headers=graph_headers(access_token),
+        timeout=60
+    )
 
-        response = requests.get(
-            check_url,
-            headers=headers,
-            timeout=30
-        )
-
-    except Exception as e:
-
-        return False, (
-            f"Folder check error: {e}"
-        )
-
+    # Folder already exists
     if response.status_code == 200:
+        return response.json()
 
-        return True, "Folder already exists"
+    # Folder doesn't exist
+    if response.status_code == 404:
 
-    # --------------------------------------------------------
-    # CREATE FOLDER
-    # --------------------------------------------------------
+        create_url = (
+            f"{GRAPH_BASE_URL}"
+            f"/users/{quote(ONEDRIVE_USER, safe='')}"
+            f"/drive/root/children"
+        )
 
-    create_url = (
-        f"{drive_url}/root/children"
-    )
+        payload = {
+            "name": ONEDRIVE_FOLDER,
+            "folder": {},
+            "@microsoft.graph.conflictBehavior": "fail"
+        }
 
-    payload = {
-        "name": folder_name,
-        "folder": {},
-        "@microsoft.graph.conflictBehavior": "fail"
-    }
-
-    headers["Content-Type"] = "application/json"
-
-    try:
-
-        response = requests.post(
+        create_response = requests.post(
             create_url,
-            headers=headers,
+            headers={
+                **graph_headers(access_token),
+                "Content-Type": "application/json"
+            },
             json=payload,
-            timeout=30
+            timeout=60
         )
 
-    except Exception as e:
+        if create_response.status_code not in [200, 201]:
 
-        return False, (
-            f"Folder creation error: {e}"
-        )
+            raise Exception(
+                f"Pending_Posts folder create failed.\n"
+                f"Status: {create_response.status_code}\n"
+                f"Response: {create_response.text}"
+            )
 
-    if response.status_code in [200, 201]:
+        return create_response.json()
 
-        return True, "Folder created"
-
-    # Folder may have been created meanwhile
-    if response.status_code == 409:
-
-        return True, "Folder already exists"
-
-    return False, (
-        f"{response.status_code} - "
-        f"{response.text}"
+    raise Exception(
+        f"Pending_Posts folder check failed.\n"
+        f"Status: {response.status_code}\n"
+        f"Response: {response.text}"
     )
 
 
 # ============================================================
-# ONEDRIVE LARGE FILE UPLOAD
+# SMALL FILE UPLOAD
 # ============================================================
 
-def upload_large_file_to_onedrive(
-    file_path,
+def upload_small_file(
     access_token,
-    folder_name="Pending_Posts"
+    file_path,
+    file_name
 ):
 
-    if not os.path.exists(file_path):
-
-        return False, (
-            "Local file nahi mili."
-        )
-
-    # --------------------------------------------------------
-    # ENSURE FOLDER
-    # --------------------------------------------------------
-
-    folder_ok, folder_msg = (
-        ensure_onedrive_folder(
-            access_token,
-            folder_name
-        )
-    )
-
-    if not folder_ok:
-
-        return False, (
-            f"Folder error: {folder_msg}"
-        )
-
-    file_name = os.path.basename(
-        file_path
-    )
-
     encoded_folder = quote(
-        folder_name,
+        ONEDRIVE_FOLDER,
         safe=""
     )
 
@@ -313,465 +311,239 @@ def upload_large_file_to_onedrive(
         safe=""
     )
 
-    drive_url = get_onedrive_drive_url()
-
-    # --------------------------------------------------------
-    # CREATE UPLOAD SESSION
-    # --------------------------------------------------------
-
-    session_url = (
-        f"{drive_url}/root:/"
-        f"{encoded_folder}/"
-        f"{encoded_file}:"
-        "/createUploadSession"
+    url = (
+        f"{GRAPH_BASE_URL}"
+        f"/users/{quote(ONEDRIVE_USER, safe='')}"
+        f"/drive/root:/{encoded_folder}/{encoded_file}:/content"
     )
 
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Content-Type": "application/json"
-    }
+    with open(file_path, "rb") as file:
+
+        response = requests.put(
+            url,
+            headers={
+                **graph_headers(access_token),
+                "Content-Type": "application/octet-stream"
+            },
+            data=file,
+            timeout=600
+        )
+
+    if response.status_code not in [200, 201]:
+
+        raise Exception(
+            f"File upload failed.\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# LARGE FILE UPLOAD SESSION
+# ============================================================
+
+def create_upload_session(
+    access_token,
+    file_name
+):
+
+    encoded_folder = quote(
+        ONEDRIVE_FOLDER,
+        safe=""
+    )
+
+    encoded_file = quote(
+        file_name,
+        safe=""
+    )
+
+    url = (
+        f"{GRAPH_BASE_URL}"
+        f"/users/{quote(ONEDRIVE_USER, safe='')}"
+        f"/drive/root:/{encoded_folder}/{encoded_file}"
+        f":/createUploadSession"
+    )
 
     payload = {
         "item": {
-            "@microsoft.graph.conflictBehavior": "rename",
+            "@microsoft.graph.conflictBehavior": "replace",
             "name": file_name
         }
     }
 
-    try:
-
-        response = requests.post(
-            session_url,
-            headers=headers,
-            json=payload,
-            timeout=30
-        )
-
-    except Exception as e:
-
-        return False, (
-            f"Upload session error: {e}"
-        )
-
-    if response.status_code not in [
-        200,
-        201
-    ]:
-
-        return False, (
-            "Upload session create nahi hua: "
-            f"{response.status_code} - "
-            f"{response.text}"
-        )
-
-    try:
-
-        upload_url = response.json().get(
-            "uploadUrl"
-        )
-
-    except Exception:
-
-        upload_url = None
-
-    if not upload_url:
-
-        return False, (
-            "Upload URL nahi mila."
-        )
-
-    # --------------------------------------------------------
-    # FILE SIZE
-    # --------------------------------------------------------
-
-    file_size = os.path.getsize(
-        file_path
+    response = requests.post(
+        url,
+        headers={
+            **graph_headers(access_token),
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=60
     )
 
-    # 5 MiB
-    # 5 MiB = 16 x 320 KiB
-    chunk_size = 5 * 1024 * 1024
-
-    start = 0
-
-    # --------------------------------------------------------
-    # UPLOAD CHUNKS
-    # --------------------------------------------------------
-
-    try:
-
-        with open(
-            file_path,
-            "rb"
-        ) as f:
-
-            while start < file_size:
-
-                f.seek(start)
-
-                chunk = f.read(
-                    chunk_size
-                )
-
-                if not chunk:
-
-                    break
-
-                end = (
-                    start
-                    + len(chunk)
-                    - 1
-                )
-
-                upload_headers = {
-
-                    "Content-Length":
-                        str(len(chunk)),
-
-                    "Content-Range":
-                        (
-                            f"bytes "
-                            f"{start}-{end}/"
-                            f"{file_size}"
-                        )
-
-                }
-
-                upload_response = (
-                    requests.put(
-                        upload_url,
-                        headers=upload_headers,
-                        data=chunk,
-                        timeout=180
-                    )
-                )
-
-                if upload_response.status_code not in [
-                    200,
-                    201,
-                    202
-                ]:
-
-                    return False, (
-                        "Upload failed: "
-                        f"{upload_response.status_code} "
-                        f"{upload_response.text}"
-                    )
-
-                start = end + 1
-
-    except Exception as e:
-
-        return False, (
-            f"Upload exception: {e}"
-        )
-
-    return True, "Upload successful"
-
-
-# ============================================================
-# VIDEO DURATION
-# ============================================================
-
-def get_video_duration(video_path):
-
-    cmd = [
-        FFMPEG,
-        "-i",
-        video_path
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True
-    )
-
-    match = re.search(
-        r"Duration:\s*(\d+):(\d+):([\d.]+)",
-        result.stderr
-    )
-
-    if not match:
-
-        return 0
-
-    hours = int(
-        match.group(1)
-    )
-
-    minutes = int(
-        match.group(2)
-    )
-
-    seconds = float(
-        match.group(3)
-    )
-
-    return (
-        hours * 3600
-        + minutes * 60
-        + seconds
-    )
-
-
-# ============================================================
-# VIDEO SPLITTER
-# ============================================================
-
-def split_video(
-    video_path,
-    output_dir,
-    clip_duration=60,
-    aspect_ratio="9:16",
-    watermark_text=""
-):
-
-    os.makedirs(
-        output_dir,
-        exist_ok=True
-    )
-
-    duration = get_video_duration(
-        video_path
-    )
-
-    if duration <= 0:
+    if response.status_code not in [200, 201]:
 
         raise Exception(
-            "Video duration read nahi ho paayi."
+            f"Upload session creation failed.\n"
+            f"Status: {response.status_code}\n"
+            f"Response: {response.text}"
         )
 
-    total_clips = int(
-        duration // clip_duration
+    data = response.json()
+
+    upload_url = data.get("uploadUrl")
+
+    if not upload_url:
+        raise Exception(
+            "Upload session URL nahi mila."
+        )
+
+    return upload_url
+
+
+# ============================================================
+# LARGE FILE UPLOAD
+# ============================================================
+
+def upload_large_file(
+    access_token,
+    file_path,
+    file_name,
+    progress_callback=None
+):
+
+    upload_url = create_upload_session(
+        access_token,
+        file_name
     )
 
-    if duration % clip_duration > 0:
+    total_size = os.path.getsize(file_path)
 
-        total_clips += 1
+    uploaded = 0
 
-    clips = []
+    with open(file_path, "rb") as file:
 
-    # --------------------------------------------------------
-    # VIDEO SIZE
-    # --------------------------------------------------------
+        while uploaded < total_size:
 
-    if "9:16" in aspect_ratio:
+            chunk = file.read(CHUNK_SIZE)
 
-        vf_scale = (
-            "scale=1080:1920:"
-            "force_original_aspect_ratio=increase,"
-            "crop=1080:1920"
-        )
+            if not chunk:
+                break
 
-    elif "16:9" in aspect_ratio:
+            start = uploaded
+            end = uploaded + len(chunk) - 1
 
-        vf_scale = (
-            "scale=1920:1080:"
-            "force_original_aspect_ratio=increase,"
-            "crop=1920:1080"
-        )
+            headers = {
+                "Content-Length": str(len(chunk)),
+                "Content-Range":
+                    f"bytes {start}-{end}/{total_size}"
+            }
 
-    elif "1:1" in aspect_ratio:
-
-        vf_scale = (
-            "scale=1080:1080:"
-            "force_original_aspect_ratio=increase,"
-            "crop=1080:1080"
-        )
-
-    else:
-
-        vf_scale = (
-            "scale=1080:1920:"
-            "force_original_aspect_ratio=increase,"
-            "crop=1080:1920"
-        )
-
-    safe_watermark = ""
-
-    if watermark_text:
-
-        safe_watermark = (
-            watermark_text
-            .replace("'", "")
-            .replace(":", "")
-        )
-
-    progress_bar = st.progress(0)
-
-    status_text = st.empty()
-
-    # --------------------------------------------------------
-    # SPLIT LOOP
-    # --------------------------------------------------------
-
-    for i in range(total_clips):
-
-        start_time = (
-            i * clip_duration
-        )
-
-        output_file = os.path.join(
-            output_dir,
-            f"Reel_Part_{i + 1}.mp4"
-        )
-
-        part_text = (
-            f"Part {i + 1}/{total_clips}"
-        )
-
-        filters = [
-
-            (
-                f"drawtext="
-                f"text='{part_text}':"
-                f"fontcolor=white:"
-                f"fontsize=60:"
-                f"box=1:"
-                f"boxcolor=black@0.6:"
-                f"boxborderw=10:"
-                f"x=(w-text_w)/2:"
-                f"y=50"
+            response = requests.put(
+                upload_url,
+                headers=headers,
+                data=chunk,
+                timeout=600
             )
 
-        ]
+            if response.status_code not in [
+                200,
+                201,
+                202
+            ]:
 
-        if safe_watermark:
-
-            filters.append(
-
-                (
-                    f"drawtext="
-                    f"text='{safe_watermark}':"
-                    f"fontcolor=white:"
-                    f"fontsize=48:"
-                    f"box=1:"
-                    f"boxcolor=black@0.5:"
-                    f"boxborderw=10:"
-                    f"x=w-tw-50:"
-                    f"y=h-th-50"
+                raise Exception(
+                    f"Chunk upload failed.\n"
+                    f"Status: {response.status_code}\n"
+                    f"Response: {response.text}"
                 )
 
-            )
+            uploaded += len(chunk)
 
-        final_filter = (
-            vf_scale
-            + ","
-            + ",".join(filters)
+            if progress_callback:
+
+                progress = (
+                    uploaded / total_size
+                    if total_size
+                    else 1
+                )
+
+                progress_callback(progress)
+
+    return True
+
+
+# ============================================================
+# UNIVERSAL FILE UPLOAD
+# ============================================================
+
+def upload_file_to_onedrive(
+    access_token,
+    file_path,
+    file_name,
+    progress_callback=None
+):
+
+    file_size = os.path.getsize(file_path)
+
+    # Small file
+    if file_size <= 4 * 1024 * 1024:
+
+        result = upload_small_file(
+            access_token,
+            file_path,
+            file_name
         )
 
-        cmd = [
+        if progress_callback:
+            progress_callback(1.0)
 
-            FFMPEG,
+        return result
 
-            "-y",
-
-            "-ss",
-            str(start_time),
-
-            "-i",
-            video_path,
-
-            "-t",
-            str(clip_duration),
-
-            "-vf",
-            final_filter,
-
-            "-c:v",
-            "libx264",
-
-            "-preset",
-            "veryfast",
-
-            "-crf",
-            "23",
-
-            "-c:a",
-            "aac",
-
-            "-b:a",
-            "128k",
-
-            "-movflags",
-            "+faststart",
-
-            output_file
-
-        ]
-
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True
-        )
-
-        if result.returncode != 0:
-
-            raise Exception(
-                "FFmpeg error:\n\n"
-                + result.stderr[-3000:]
-            )
-
-        if os.path.exists(
-            output_file
-        ):
-
-            clips.append(
-                output_file
-            )
-
-        progress_bar.progress(
-            (i + 1) / total_clips
-        )
-
-        status_text.text(
-            f"⚡ Processing Clip "
-            f"{i + 1}/{total_clips}"
-        )
-
-    status_text.text(
-        "✅ Video processing complete!"
+    # Large file
+    return upload_large_file(
+        access_token,
+        file_path,
+        file_name,
+        progress_callback
     )
 
-    return clips
-
 
 # ============================================================
-# HEADER
+# CONNECT ONEDRIVE
 # ============================================================
 
-st.markdown("""
-<div style="
-    padding:10px 0;
-    border-bottom:1px solid #30363d;
-    margin-bottom:25px;
-">
+def connect_onedrive():
 
-<h1 style="
-    color:#c9d1d9;
-    margin:0;
-    font-size:30px;
-">
+    try:
 
-🎬 Pro Video Studio
+        with st.spinner(
+            "🔐 Microsoft Graph se connect ho raha hai..."
+        ):
 
-</h1>
+            token = get_application_access_token()
 
-<p style="
-    color:#8b949e;
-    margin-top:6px;
-">
+            drive = get_onedrive_drive(token)
 
-Streamlit + OneDrive + GitHub Actions Hybrid System
+            ensure_pending_posts_folder(token)
 
-</p>
+            st.session_state.onedrive_access_token = token
+            st.session_state.onedrive_drive_id = drive["id"]
+            st.session_state.onedrive_connected = True
 
-</div>
-""", unsafe_allow_html=True)
+        return True
+
+    except Exception as e:
+
+        st.session_state.onedrive_connected = False
+
+        st.error(
+            f"❌ OneDrive connection failed:\n\n{e}"
+        )
+
+        return False
 
 
 # ============================================================
@@ -780,607 +552,470 @@ Streamlit + OneDrive + GitHub Actions Hybrid System
 
 with st.sidebar:
 
-    st.markdown(
-        "## ☁️ Microsoft / Azure"
-    )
+    st.header("⚙️ Settings")
 
-    # --------------------------------------------------------
-    # STREAMLIT SECRETS
-    # --------------------------------------------------------
+    st.subheader("☁️ OneDrive")
 
-    try:
-
-        default_client_id = st.secrets.get(
-            "AZURE_CLIENT_ID",
-            ""
-        )
-
-        default_tenant_id = st.secrets.get(
-            "AZURE_TENANT_ID",
-            ""
-        )
-
-        default_client_secret = st.secrets.get(
-            "AZURE_CLIENT_SECRET",
-            ""
-        )
-
-    except Exception:
-
-        default_client_id = ""
-        default_tenant_id = ""
-        default_client_secret = ""
-
-    client_id = st.text_input(
-        "Azure Client ID",
-        value=default_client_id
-    )
-
-    tenant_id = st.text_input(
-        "Azure Tenant ID",
-        value=default_tenant_id
-    )
-
-    client_secret = st.text_input(
-        "Azure Client Secret",
-        value=default_client_secret,
-        type="password"
-    )
-
-    st.markdown("---")
-
-    st.markdown(
-        "## 📘 Facebook Post Settings"
-    )
-
-    fb_page_id = st.text_input(
-        "Facebook Page ID"
-    )
-
-    fb_post_type = st.selectbox(
-        "Post Type",
-        [
-            "Facebook Reel (Short)",
-            "Normal Page Video Post"
-        ]
-    )
-
-    default_caption = st.text_area(
-        "Default Caption",
-        value=(
-            "Check out this amazing clip! 🔥"
-        )
-    )
-
-    st.info(
-        "Facebook Access Token ab OneDrive metadata "
-        "mein save nahi hoga. Phase 3 mein isko "
-        "GitHub Secrets mein rakhenge."
-    )
-
-    st.markdown("---")
-
-    st.markdown(
-        "## 🎛️ Video Settings"
-    )
-
-    uploaded_file = st.file_uploader(
-        "📁 Upload Video",
-        type=[
-            "mp4",
-            "mov",
-            "avi",
-            "mkv"
-        ]
-    )
-
-    clip_duration = st.slider(
-        "Clip Duration (Seconds)",
-        min_value=15,
-        max_value=120,
-        value=60,
-        step=15
-    )
-
-    aspect_ratio = st.selectbox(
-        "Output Format",
-        [
-            "9:16 (Vertical / Reels)",
-            "16:9 (Landscape)",
-            "1:1 (Square)"
-        ]
-    )
-
-    watermark_text = st.text_input(
-        "🏷️ Watermark",
-        placeholder="@YourPage"
-    )
-
-
-# ============================================================
-# ONEDRIVE APPLICATION CONNECTION
-# ============================================================
-
-if (
-    client_id
-    and tenant_id
-    and client_secret
-):
-
-    st.markdown(
-        "### ☁️ OneDrive Connection"
-    )
-
-    # --------------------------------------------------------
-    # GET APP-ONLY TOKEN
-    # --------------------------------------------------------
-
-    try:
-
-        if not st.session_state.onedrive_access_token:
-
-            with st.spinner(
-                "Connecting to OneDrive..."
-            ):
-
-                token = (
-                    get_application_access_token(
-                        client_id,
-                        tenant_id,
-                        client_secret
-                    )
-                )
-
-                st.session_state.onedrive_access_token = (
-                    token
-                )
+    if st.session_state.onedrive_connected:
 
         st.success(
             "✅ OneDrive Connected"
         )
 
         st.caption(
-            f"Target OneDrive: {ONEDRIVE_USER}"
-        )
-
-        st.caption(
-            "Authentication: Microsoft Graph "
-            "Application Permission"
-        )
-
-        # ----------------------------------------------------
-        # DISCONNECT
-        # ----------------------------------------------------
-
-        if st.button(
-            "Disconnect"
-        ):
-
-            st.session_state.onedrive_access_token = None
-
-            st.rerun()
-
-    except Exception as e:
-
-        st.session_state.onedrive_access_token = None
-
-        st.error(
-            "❌ Microsoft / OneDrive connection failed."
-        )
-
-        st.code(
-            str(e)
-        )
-
-else:
-
-    st.warning(
-        "👈 Azure Client ID, Tenant ID aur Client Secret "
-        "enter karein."
-    )
-
-
-# ============================================================
-# VIDEO UPLOAD TO TEMP
-# ============================================================
-
-if uploaded_file is not None:
-
-    os.makedirs(
-        "/tmp/uploads",
-        exist_ok=True
-    )
-
-    temp_input_path = os.path.join(
-        "/tmp/uploads",
-        uploaded_file.name
-    )
-
-    file_changed = (
-        st.session_state.input_file
-        != temp_input_path
-        or
-        not os.path.exists(
-            temp_input_path
-        )
-    )
-
-    if file_changed:
-
-        with open(
-            temp_input_path,
-            "wb"
-        ) as f:
-
-            f.write(
-                uploaded_file.getbuffer()
-            )
-
-        st.session_state.input_file = (
-            temp_input_path
-        )
-
-        st.session_state.duration = (
-            get_video_duration(
-                temp_input_path
-            )
-        )
-
-        st.session_state.clips = []
-
-
-# ============================================================
-# MAIN WORKSPACE
-# ============================================================
-
-if (
-    st.session_state.input_file
-    and os.path.exists(
-        st.session_state.input_file
-    )
-):
-
-    st.markdown("---")
-
-    col1, col2, col3 = st.columns(3)
-
-    with col1:
-
-        st.metric(
-            "Video",
-            os.path.basename(
-                st.session_state.input_file
-            )
-        )
-
-    with col2:
-
-        st.metric(
-            "Duration",
-            f"{st.session_state.duration:.1f} sec"
-        )
-
-    estimated_clips = int(
-        st.session_state.duration
-        // clip_duration
-    )
-
-    if (
-        st.session_state.duration
-        % clip_duration
-    ):
-
-        estimated_clips += 1
-
-    with col3:
-
-        st.metric(
-            "Estimated Clips",
-            estimated_clips
-        )
-
-    st.markdown(
-        "## 🚀 Render Workspace"
-    )
-
-    if not st.session_state.onedrive_access_token:
-
-        st.info(
-            "Video split karne se pehle "
-            "OneDrive connect karein."
+            f"Folder: {ONEDRIVE_FOLDER}"
         )
 
     else:
 
-        if st.button(
-            "⚡ Start Splitting & Processing",
-            type="primary",
-            use_container_width=True
-        ):
-
-            output_dir = (
-                "/tmp/reels"
-            )
-
-            if os.path.exists(
-                output_dir
-            ):
-
-                shutil.rmtree(
-                    output_dir
-                )
-
-            os.makedirs(
-                output_dir,
-                exist_ok=True
-            )
-
-            try:
-
-                with st.spinner(
-                    "FFmpeg video clips generate kar raha hai..."
-                ):
-
-                    st.session_state.clips = (
-                        split_video(
-                            st.session_state.input_file,
-                            output_dir,
-                            clip_duration,
-                            aspect_ratio,
-                            watermark_text
-                        )
-                    )
-
-                st.success(
-                    f"✅ {len(st.session_state.clips)} "
-                    f"clips generated!"
-                )
-
-            except Exception as e:
-
-                st.error(
-                    "❌ Processing failed"
-                )
-
-                st.code(
-                    str(e)
-                )
-
-
-# ============================================================
-# CLIPS
-# ============================================================
-
-if st.session_state.clips:
-
-    st.markdown("---")
-
-    st.markdown(
-        "## 📦 Generated Clips"
-    )
-
-    clip_columns = st.columns(2)
-
-    for index, clip in enumerate(
-        st.session_state.clips
-    ):
-
-        with clip_columns[
-            index % 2
-        ]:
-
-            st.markdown(
-                f"### 🎞️ Part {index + 1}"
-            )
-
-            st.video(
-                clip
-            )
-
-            with open(
-                clip,
-                "rb"
-            ) as f:
-
-                st.download_button(
-                    label=(
-                        f"⬇️ Download Part {index + 1}"
-                    ),
-                    data=f.read(),
-                    file_name=os.path.basename(
-                        clip
-                    ),
-                    mime="video/mp4",
-                    key=f"download_{index}"
-                )
-
-
-# ============================================================
-# SEND TO ONEDRIVE
-# ============================================================
-
-if (
-    st.session_state.clips
-    and st.session_state.onedrive_access_token
-):
-
-    st.markdown("---")
-
-    st.markdown(
-        "## ☁️ Send to Background Automation"
-    )
-
-    st.write(
-        "Clips OneDrive ke `Pending_Posts` folder "
-        "mein upload hongi."
-    )
+        st.warning(
+            "OneDrive not connected"
+        )
 
     if st.button(
-        "☁️ Upload All Clips to OneDrive",
-        type="primary",
+        "🔗 Connect OneDrive",
         use_container_width=True
     ):
 
-        if not fb_page_id:
+        connect_onedrive()
 
-            st.error(
-                "Facebook Page ID enter karein."
+    st.divider()
+
+    st.subheader("🎞️ Video Settings")
+
+    clip_duration = st.number_input(
+        "Clip Duration (seconds)",
+        min_value=1,
+        max_value=600,
+        value=30,
+        step=1
+    )
+
+    aspect_ratio = st.selectbox(
+        "Aspect Ratio",
+        [
+            "Original",
+            "9:16",
+            "16:9",
+            "1:1"
+        ]
+    )
+
+    watermark_text = st.text_input(
+        "Watermark Text",
+        value=""
+    )
+
+    st.divider()
+
+    st.subheader("📘 Facebook Metadata")
+
+    facebook_page_id = st.text_input(
+        "Facebook Page ID",
+        value=""
+    )
+
+    post_type = st.selectbox(
+        "Post Type",
+        [
+            "Video",
+            "Reel"
+        ]
+    )
+
+    caption = st.text_area(
+        "Caption",
+        value=""
+    )
+
+
+# ============================================================
+# MAIN UPLOAD
+# ============================================================
+
+st.header("📤 Upload Video")
+
+uploaded_video = st.file_uploader(
+    "Video file select karein",
+    type=[
+        "mp4",
+        "mov",
+        "mkv",
+        "avi",
+        "webm"
+    ]
+)
+
+
+# ============================================================
+# VIDEO PROCESSING FUNCTIONS
+# ============================================================
+
+def get_video_duration(file_path):
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise Exception(
+            "FFprobe video duration read nahi kar paaya."
+        )
+
+    return float(
+        result.stdout.strip()
+    )
+
+
+def split_video(
+    input_file,
+    output_directory,
+    clip_duration
+):
+
+    os.makedirs(
+        output_directory,
+        exist_ok=True
+    )
+
+    output_pattern = os.path.join(
+        output_directory,
+        "clip_%03d.mp4"
+    )
+
+    command = [
+        "ffmpeg",
+        "-y",
+        "-i",
+        input_file,
+        "-map",
+        "0",
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_time",
+        str(clip_duration),
+        "-reset_timestamps",
+        "1",
+        output_pattern
+    ]
+
+    result = subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True
+    )
+
+    if result.returncode != 0:
+
+        raise Exception(
+            "Video splitting failed:\n"
+            + result.stderr[-3000:]
+        )
+
+    clips = sorted(
+        Path(output_directory).glob(
+            "clip_*.mp4"
+        )
+    )
+
+    return clips
+
+
+# ============================================================
+# PROCESS VIDEO
+# ============================================================
+
+if uploaded_video:
+
+    st.success(
+        f"Selected: {uploaded_video.name}"
+    )
+
+    st.write(
+        f"File size: "
+        f"{uploaded_video.size / (1024 * 1024):.2f} MB"
+    )
+
+    process_button = st.button(
+        "🎬 Split Video & Upload to OneDrive",
+        type="primary",
+        use_container_width=True
+    )
+
+    if process_button:
+
+        if not st.session_state.onedrive_connected:
+
+            st.warning(
+                "⚠️ Pehle **Connect OneDrive** button click karein."
             )
 
-        else:
+            st.stop()
 
-            total_items = (
-                len(
-                    st.session_state.clips
+        temp_root = tempfile.mkdtemp(
+            prefix="video_studio_"
+        )
+
+        input_path = os.path.join(
+            temp_root,
+            uploaded_video.name
+        )
+
+        clips_directory = os.path.join(
+            temp_root,
+            "clips"
+        )
+
+        try:
+
+            # ------------------------------------------------
+            # SAVE ORIGINAL VIDEO
+            # ------------------------------------------------
+
+            with open(
+                input_path,
+                "wb"
+            ) as file:
+
+                file.write(
+                    uploaded_video.getbuffer()
                 )
-                + 1
+
+            st.info(
+                "📥 Video uploaded successfully. "
+                "Processing start ho raha hai..."
             )
 
-            progress = st.progress(0)
+            # ------------------------------------------------
+            # VIDEO DURATION
+            # ------------------------------------------------
 
-            status = st.empty()
+            duration = get_video_duration(
+                input_path
+            )
 
-            upload_failed = False
+            st.write(
+                f"⏱️ Video Duration: "
+                f"{duration:.2f} seconds"
+            )
+
+            # ------------------------------------------------
+            # SPLIT VIDEO
+            # ------------------------------------------------
+
+            with st.spinner(
+                "✂️ Video split ho raha hai..."
+            ):
+
+                clips = split_video(
+                    input_path,
+                    clips_directory,
+                    clip_duration
+                )
+
+            if not clips:
+
+                raise Exception(
+                    "Koi clip generate nahi hui."
+                )
+
+            st.success(
+                f"✅ {len(clips)} clips generate hui."
+            )
 
             # ------------------------------------------------
             # UPLOAD CLIPS
             # ------------------------------------------------
 
-            for index, clip in enumerate(
-                st.session_state.clips
-            ):
+            st.subheader(
+                "☁️ Uploading to OneDrive"
+            )
 
-                status.text(
-                    f"☁️ Uploading "
-                    f"{os.path.basename(clip)}..."
+            overall_progress = st.progress(
+                0
+            )
+
+            status_text = st.empty()
+
+            uploaded_count = 0
+
+            total_clips = len(clips)
+
+            for index, clip_path in enumerate(clips):
+
+                clip_number = index + 1
+
+                original_name = clip_path.name
+
+                # Safe filename
+                final_name = (
+                    f"{Path(uploaded_video.name).stem}"
+                    f"_clip_{clip_number:03d}.mp4"
                 )
 
-                success, message = (
-                    upload_large_file_to_onedrive(
-                        clip,
-                        st.session_state.onedrive_access_token,
-                        "Pending_Posts"
-                    )
+                status_text.write(
+                    f"⬆️ Uploading "
+                    f"{clip_number}/{total_clips}: "
+                    f"{final_name}"
                 )
 
-                if not success:
+                clip_progress = st.progress(
+                    0
+                )
 
-                    st.error(
-                        f"{os.path.basename(clip)}: "
-                        f"{message}"
+                def update_progress(value):
+                    clip_progress.progress(
+                        min(
+                            max(value, 0.0),
+                            1.0
+                        )
                     )
 
-                    upload_failed = True
+                upload_file_to_onedrive(
+                    st.session_state.onedrive_access_token,
+                    str(clip_path),
+                    final_name,
+                    update_progress
+                )
 
-                progress.progress(
-                    (index + 1)
-                    / total_items
+                uploaded_count += 1
+
+                overall_progress.progress(
+                    uploaded_count / total_clips
                 )
 
             # ------------------------------------------------
-            # METADATA
+            # METADATA JSON
             # ------------------------------------------------
 
-            if not upload_failed:
+            metadata = {
+                "source_video": uploaded_video.name,
+                "post_type": post_type,
+                "facebook_page_id": facebook_page_id,
+                "caption": caption,
+                "total_clips": total_clips,
+                "clip_duration_seconds": clip_duration,
+                "aspect_ratio": aspect_ratio,
+                "watermark_text": watermark_text,
+                "status": "Pending"
+            }
 
-                metadata = {
+            metadata_path = os.path.join(
+                temp_root,
+                "metadata.json"
+            )
 
-                    "facebook_page_id":
-                        fb_page_id,
+            with open(
+                metadata_path,
+                "w",
+                encoding="utf-8"
+            ) as metadata_file:
 
-                    "caption":
-                        default_caption,
-
-                    "post_type":
-                        fb_post_type,
-
-                    "total_clips":
-                        len(
-                            st.session_state.clips
-                        ),
-
-                    "clip_duration_seconds":
-                        clip_duration
-
-                }
-
-                metadata_path = (
-                    "/tmp/metadata.json"
+                json.dump(
+                    metadata,
+                    metadata_file,
+                    indent=4,
+                    ensure_ascii=False
                 )
 
-                with open(
-                    metadata_path,
-                    "w",
-                    encoding="utf-8"
-                ) as f:
+            # ------------------------------------------------
+            # UPLOAD METADATA
+            # ------------------------------------------------
 
-                    json.dump(
-                        metadata,
-                        f,
-                        indent=4,
-                        ensure_ascii=False
-                    )
+            status_text.write(
+                "⬆️ Uploading metadata.json..."
+            )
 
-                status.text(
-                    "☁️ Uploading metadata.json..."
+            upload_file_to_onedrive(
+                st.session_state.onedrive_access_token,
+                metadata_path,
+                f"{Path(uploaded_video.name).stem}_metadata.json"
+            )
+
+            # ------------------------------------------------
+            # COMPLETE
+            # ------------------------------------------------
+
+            overall_progress.progress(
+                1.0
+            )
+
+            st.success(
+                f"""
+                🎉 Processing complete!
+
+                ✅ Clips generated: {total_clips}
+
+                ✅ Clips uploaded: {uploaded_count}
+
+                ☁️ OneDrive folder: {ONEDRIVE_FOLDER}
+
+                📘 Metadata uploaded successfully.
+                """
+            )
+
+            st.info(
+                "GitHub Actions ab Pending_Posts folder "
+                "se clips process/publish kar sakta hai."
+            )
+
+        except Exception as e:
+
+            st.error(
+                f"❌ Processing failed:\n\n{e}"
+            )
+
+        finally:
+
+            # ------------------------------------------------
+            # CLEAN TEMP FILES
+            # ------------------------------------------------
+
+            try:
+
+                import shutil
+
+                shutil.rmtree(
+                    temp_root,
+                    ignore_errors=True
                 )
 
-                meta_success, meta_message = (
-                    upload_large_file_to_onedrive(
-                        metadata_path,
-                        st.session_state.onedrive_access_token,
-                        "Pending_Posts"
-                    )
-                )
-
-                progress.progress(1.0)
-
-                if meta_success:
-
-                    status.empty()
-
-                    st.success(
-                        "🎉 Upload complete! "
-                        "Clips OneDrive ke Pending_Posts "
-                        "folder mein ready hain."
-                    )
-
-                    st.info(
-                        "Ab next phase mein GitHub Actions "
-                        "in clips ko automatically Facebook "
-                        "par post karega."
-                    )
-
-                else:
-
-                    st.error(
-                        f"metadata.json upload failed: "
-                        f"{meta_message}"
-                    )
+            except Exception:
+                pass
 
 
 # ============================================================
-# NO VIDEO STATE
+# FOOTER / STATUS
 # ============================================================
+
+st.divider()
+
+if st.session_state.onedrive_connected:
+
+    st.success(
+        "🟢 OneDrive Ready — Pending_Posts folder active"
+    )
 
 else:
 
-    if not st.session_state.input_file:
-
-        st.markdown("""
-        <div style="
-            text-align:center;
-            padding:60px 20px;
-            background-color:#161b22;
-            border:1px dashed #30363d;
-            border-radius:12px;
-        ">
-
-        <h3>📂 No Video Loaded</h3>
-
-        <p style="color:#8b949e;">
-        Sidebar se video upload karein.
-        </p>
-
-        </div>
-        """, unsafe_allow_html=True)
+    st.caption(
+        "🔴 OneDrive disconnected"
+    )
+```
