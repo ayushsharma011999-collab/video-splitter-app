@@ -1,3 +1,27 @@
-AZURE_TENANT_ID
-AZURE_CLIENT_ID
-AZURE_CLIENT_SECRET
+name: OneDrive Connection Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-onedrive:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Test Azure credentials
+        env:
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+        run: |
+          echo "Azure credentials loaded successfully"
+          echo "Tenant ID length: ${#AZURE_TENANT_ID}"
+          echo "Client ID length: ${#AZURE_CLIENT_ID}"
+          echo "Client Secret length: ${#AZURE_CLIENT_SECRET}"
+
+          if [ -z "$AZURE_TENANT_ID" ] || [ -z "$AZURE_CLIENT_ID" ] || [ -z "$AZURE_CLIENT_SECRET" ]; then
+            echo "ERROR: One or more Azure secrets are missing."
+            exit 1
+          fi
+
+          echo "All three Azure secrets are available."
