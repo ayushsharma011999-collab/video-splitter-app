@@ -121,11 +121,25 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
     else:
         vf_scale = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920"
 
-    if watermark_text.strip():
-        safe_text = watermark_text.replace("'", "").replace(":", "")
-        watermark_filter = f",drawtext=text='{safe_text}':fontcolor=white:fontsize=48:box=1:boxcolor=black@0.5:boxborderw=10:x=w-tw-50:y=h-th-50"
-    else:
-        watermark_filter = ""
+    safe_watermark = watermark_text.replace("'", "").replace(":", "") if watermark_text else ""
+
+part_text = f"Part {i+1}/{total_clips}"
+
+overlay_filters = [
+    f"drawtext=text='{part_text}':fontcolor=white:fontsize=60:"
+    f"box=1:boxcolor=black@0.6:boxborderw=10:"
+    f"x=(w-text_w)/2:y=50"
+]
+
+if safe_watermark:
+    overlay_filters.append(
+        f"drawtext=text='{safe_watermark}':"
+        f"fontcolor=white:fontsize=48:"
+        f"box=1:boxcolor=black@0.5:boxborderw=10:"
+        f"x=w-tw-50:y=h-th-50"
+    )
+
+watermark_filter = "," + ",".join(overlay_filters)
 
     final_vf = vf_scale + watermark_filter
 
