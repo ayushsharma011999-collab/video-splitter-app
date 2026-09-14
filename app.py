@@ -5,6 +5,9 @@ import zipfile
 import requests
 import streamlit as st
 import re
+from datetime import datetime
+import time
+import threading
 
 # =========================
 # CONFIG & UI STYLING
@@ -38,6 +41,17 @@ st.markdown("""
         font-weight: 600;
         padding: 0.5rem 1rem;
     }
+    .log-box {
+        background-color: #0d1117;
+        border: 1px solid #30363d;
+        padding: 12px;
+        border-radius: 8px;
+        font-family: monospace;
+        font-size: 13px;
+        color: #7ee787;
+        max-height: 250px;
+        overflow-y: auto;
+    }
     </style>
 """, unsafe_allow_html=True)
 
@@ -47,13 +61,21 @@ if not FFMPEG:
     st.error("⚠️ FFmpeg install nahi hua. Please packages.txt check karein.")
     st.stop()
 
-# Initialize Session State
+# Initialize Session State & History Logs
 if "input_file" not in st.session_state:
     st.session_state.input_file = None
 if "clips" not in st.session_state:
     st.session_state.clips = []
 if "duration" not in st.session_state:
     st.session_state.duration = 0
+if "activity_logs" not in st.session_state:
+    st.session_state.activity_logs = []
+if "queue_status" not in st.session_state:
+    st.session_state.queue_status = "Idle"
+
+def add_log(message):
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    st.session_state.activity_logs.insert(0, f"[{timestamp}] {message}")
 
 
 # =========================
@@ -109,6 +131,8 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
     progress_bar = st.progress(0)
     status_text = st.empty()
 
+    add_log(f"Started splitting video into {total_clips} clips ({clip_duration}s each)...")
+
     for i in range(total_clips):
         start = i * clip_duration
         output_file = os.path.join(output_dir, f"Reel_Part_{i + 1}.mp4")
@@ -132,6 +156,7 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
         result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
         if result.returncode != 0:
+            add_log(f"Error at clip {i+1}: FFmpeg failed.")
             raise Exception("FFmpeg error:\n\n" + result.stderr[-3000:])
 
         if os.path.exists(output_file):
@@ -140,8 +165,10 @@ def split_video(video_path, output_dir, clip_duration=60, aspect_ratio="9:16", w
         progress_percentage = (i + 1) / total_clips
         progress_bar.progress(progress_percentage)
         status_text.text(f"⚡ Processing Clip {i + 1} of {total_clips}...")
+        add_log(f"Successfully generated Reel_Part_{i + 1}.mp4")
 
     status_text.text("✨ Processing complete successfully!")
+    add_log("Video splitting workflow completed successfully.")
     return clips
 
 
@@ -152,44 +179,25 @@ def create_zip(files, zip_name):
 
 
 def publish_to_facebook_reel(video_path, page_id, access_token, caption):
-    """
-    Publishes a video file as a Facebook Reel using Meta Graph API.
-    Step 1: Initialize upload session.
-    Step 2: Upload binary video chunks.
-    Step 3: Publish the reel.
-    """
     try:
-        # Step 1: Initialize upload session
+        add_log(f"Initiating Facebook upload for {os.path.basename(video_path)}...")
         init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
-        init_payload = {
-            "upload_phase": "start",
-            "access_token": access_token
-        }
+        init_payload = {"upload_phase": "start", "access_token": access_token}
         res = requests.post(init_url, data=init_payload)
         res_data = res.json()
 
         if "video_id" not in res_data or "upload_url" not in res_data:
+            add_log(f"FB Init Failed: {res_data}")
             return False, f"Initialization Failed: {res_data}"
 
         video_id = res_data["video_id"]
         upload_url = res_data["upload_url"]
         file_size = os.path.getsize(video_path)
 
-        # Step 2: Upload video binary data to rupload endpoint
         with open(video_path, "rb") as video_file:
-            headers = {
-                "Authorization": f"OAuth {access_token}",
-                "offset": "0",
-                "file_size": str(file_size)
-            }
-            upload_res = requests.post(upload_url, data=video_file, headers=headers)
-            upload_data = upload_res.json()
+            headers = {"Authorization": f"OAuth {access_token}", "offset": "0", "file_size": str(file_size)}
+            requests.post(upload_url, data=video_file, headers=headers)
 
-            if not upload_data.get("success", False) and upload_res.status_code != 200:
-                # Some successful responses return status 200 directly without explicit success flag
-                pass
-
-        # Step 3: Publish the Reel session
         publish_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
         publish_payload = {
             "access_token": access_token,
@@ -202,12 +210,40 @@ def publish_to_facebook_reel(video_path, page_id, access_token, caption):
         pub_data = pub_res.json()
 
         if pub_data.get("success", False):
-            return True, "Reel successfully published to Facebook Page! 🚀"
+            add_log(f"Successfully published {os.path.basename(video_path)} to Facebook!")
+            return True, "Reel successfully published!"
         else:
+            add_log(f"FB Publish Failed: {pub_data}")
             return False, f"Publish Error: {pub_data}"
-
     except Exception as e:
+        add_log(f"FB Exception: {str(e)}")
         return False, str(e)
+
+
+def background_hourly_poster(clips_list, page_id, access_token, caption):
+    """Background worker thread that posts clips one by one every 1 hour (3600s)."""
+    st.session_state.queue_status = "Running 🟢"
+    add_log("Background hourly publishing queue started...")
+    
+    for idx, clip in enumerate(clips_list):
+        add_log(f"Queue item {idx+1}/{len(clips_list)}: Waiting to publish {os.path.basename(clip)}...")
+        
+        # If it's not the very first clip, wait for 1 hour (3600 seconds)
+        # Note: For testing purposes you can temporarily lower this, but 3600 = 1 hour
+        if idx > 0:
+            wait_time = 3600 
+            elapsed = 0
+            while elapsed < wait_time:
+                time.sleep(60) # check every minute
+                elapsed += 60
+                # st.session_state.queue_status = f"Waiting ({int((wait_time-elapsed)/60)} mins left)..."
+
+        success, msg = publish_to_facebook_reel(clip, page_id, access_token, f"{caption} (Part {idx+1})")
+        if not success:
+            add_log(f"Failed to auto-post {os.path.basename(clip)}: {msg}")
+            
+    st.session_state.queue_status = "Completed ✅"
+    add_log("All clips in the hourly queue have been processed!")
 
 
 # =========================
@@ -216,8 +252,8 @@ def publish_to_facebook_reel(video_path, page_id, access_token, caption):
 
 st.markdown("""
     <div style="padding: 10px 0; border-bottom: 1px solid #30363d; margin-bottom: 25px;">
-        <h1 style="color: #c9d1d9; margin: 0; font-size: 28px;">🎬 Pro Video Studio & FB Auto-Poster</h1>
-        <p style="color: #8b949e; margin: 5px 0 0 0;">Split videos into shorts & publish directly to Facebook Pages automatically.</p>
+        <h1 style="color: #c9d1d9; margin: 0; font-size: 28px;">🎬 Pro Video Studio & Hourly Auto-Poster</h1>
+        <p style="color: #8b949e; margin: 5px 0 0 0;">Split videos & schedule automated 1-hour interval postings to Facebook.</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -233,7 +269,6 @@ with st.sidebar:
     
     st.markdown("---")
     st.markdown("### ⚙️ Video Parameters")
-    
     clip_duration = st.slider("Clip Duration (Sec)", 15, 120, 60, 15)
     aspect_ratio = st.selectbox("Format", ["9:16 (Vertical / Reels)", "16:9 (YouTube)", "1:1 (Square)"])
     watermark_text = st.text_input("🏷️ Watermark", placeholder="@Channel")
@@ -242,7 +277,7 @@ with st.sidebar:
     st.markdown("### 📘 Facebook Auto-Post Setup")
     fb_page_id = st.text_input("Facebook Page ID", placeholder="e.g. 1092837465")
     fb_access_token = st.text_input("Page Access Token", type="password", placeholder="EAAG...")
-    default_caption = st.text_area("Default Reel Caption", value="Check out this amazing reel! 🔥 #Reels #Shorts")
+    default_caption = st.text_area("Default Reel Caption", value="Check out this amazing reel! 🔥 #Reels")
 
 
 # Handle file upload persistence
@@ -254,6 +289,7 @@ if uploaded_file is not None:
         st.session_state.input_file = temp_input_path
         st.session_state.duration = get_video_duration(temp_input_path)
         st.session_state.clips = []
+        add_log(f"New video uploaded: {uploaded_file.name} ({st.session_state.duration:.1f}s)")
 
 # Main Workspace
 if st.session_state.input_file and os.path.exists(st.session_state.input_file):
@@ -282,15 +318,24 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
             </div>
         """, unsafe_allow_html=True)
 
-    st.markdown("### 🚀 Render Workspace")
-    col_btn1, col_btn2 = st.columns([2, 1])
-    with col_btn1:
-        start_process = st.button("⚡ Start Splitting & Processing", type="primary", use_container_width=True)
-    with col_btn2:
-        if st.button("🧹 Clear Workspace", use_container_width=True):
-            st.session_state.clips = []
-            st.session_state.input_file = None
-            st.rerun()
+    col_workspace, col_history = st.columns([1.2, 0.8])
+
+    with col_workspace:
+        st.markdown("### 🚀 Render Workspace")
+        col_btn1, col_btn2 = st.columns([2, 1])
+        with col_btn1:
+            start_process = st.button("⚡ Start Splitting & Processing", type="primary", use_container_width=True)
+        with col_btn2:
+            if st.button("🧹 Clear Workspace", use_container_width=True):
+                st.session_state.clips = []
+                st.session_state.input_file = None
+                add_log("Workspace cleared by user.")
+                st.rerun()
+
+    with col_history:
+        st.markdown(f"### 📊 Live Telemetry & Queue ({st.session_state.queue_status})")
+        logs_html = "<br>".join(st.session_state.activity_logs[:10]) if st.session_state.activity_logs else "No activity yet."
+        st.markdown(f'<div class="log-box">{logs_html}</div>', unsafe_allow_html=True)
 
     if start_process:
         output_dir = "/tmp/reels"
@@ -311,24 +356,25 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
             st.error("❌ Processing failed!")
             st.code(str(e))
 
-    # Output Gallery & FB Auto-Post Buttons
+    # Output Gallery & Hourly Scheduler Queue Trigger
     if st.session_state.clips:
         st.markdown("---")
-        st.markdown("### 📦 Generated Clips & Social Publishing Hub")
+        st.markdown("### 📦 Generated Clips & Hourly Automation Queue")
         
-        zip_file = "/tmp/reels.zip"
-        create_zip(st.session_state.clips, zip_file)
-        if os.path.exists(zip_file):
-            with open(zip_file, "rb") as f:
-                st.download_button(
-                    label="📥 Download All Clips as ZIP Package",
-                    data=f.read(),
-                    file_name="processed_reels.zip",
-                    mime="application/zip",
-                    key="dl_zip_top",
-                    use_container_width=True
+        # Hourly Automation Scheduler Trigger Button
+        if st.button("⏰ Start 1-Hour Interval Auto-Posting Queue for All Clips", type="primary", use_container_width=True):
+            if not fb_page_id or not fb_access_token:
+                st.error("⚠️ Please enter Facebook Page ID and Access Token in the sidebar first!")
+            else:
+                # Run background thread so UI doesn't freeze
+                bg_thread = threading.Thread(
+                    target=background_hourly_poster,
+                    args=(st.session_state.clips, fb_page_id, fb_access_token, default_caption),
+                    daemon=True
                 )
-        
+                bg_thread.start()
+                st.success("✅ Hourly background queue started successfully! Check telemetry box for updates.")
+
         st.markdown("<br>", unsafe_allow_html=True)
 
         clip_cols = st.columns(2)
@@ -342,7 +388,6 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                     """, unsafe_allow_html=True)
                     st.video(clip)
                     
-                    # Local Download button
                     with open(clip, "rb") as f:
                         st.download_button(
                             label=f"⬇️ Download {os.path.basename(clip)}",
@@ -352,8 +397,7 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                             key=f"dl_clip_{idx}"
                         )
                     
-                    # Facebook Auto Post Trigger Button
-                    if st.button(f"🚀 Publish to Facebook Page (Reel #{idx+1})", key=f"fb_post_{idx}", type="secondary"):
+                    if st.button(f"🚀 Publish Instantly (Reel #{idx+1})", key=f"fb_post_{idx}", type="secondary"):
                         if not fb_page_id or not fb_access_token:
                             st.error("⚠️ Please enter Facebook Page ID and Access Token in the sidebar!")
                         else:
@@ -364,12 +408,12 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                                 else:
                                     st.error(msg)
                     
-                    st.markdown("<br>", unsafe_allow_html=KeyError if 'KeyError' in globals() else "<br>")
+                    st.markdown("<br>", unsafe_allow_html=True)
 
 else:
     st.markdown("""
         <div style="text-align: center; padding: 60px 20px; background-color: #161b22; border: 1px dashed #30363d; border-radius: 12px;">
             <h3>📂 No Video Loaded Yet</h3>
-            <p style="color: #8b949e;">Please use the sidebar to upload a video file to begin automated processing and posting.</p>
+            <p style="color: #8b949e;">Please use the sidebar to upload a video file to begin automated processing and scheduling.</p>
         </div>
     """, unsafe_allow_html=True)
