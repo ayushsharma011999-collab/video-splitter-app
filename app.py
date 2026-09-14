@@ -5,7 +5,8 @@ import zipfile
 import requests
 import streamlit as st
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
+import json
 import time
 import threading
 
@@ -178,67 +179,88 @@ def create_zip(files, zip_name):
             zip_file.write(file, os.path.basename(file))
 
 
-def publish_to_facebook_reel(video_path, page_id, access_token, caption):
+def publish_to_facebook(video_path, page_id, access_token, caption, post_type="Facebook Reel (Short)"):
+    """
+    Publishes video either as a Facebook Reel or a Normal Page Video based on user choice.
+    """
     try:
-        add_log(f"Initiating Facebook upload for {os.path.basename(video_path)}...")
-        init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
-        init_payload = {"upload_phase": "start", "access_token": access_token}
-        res = requests.post(init_url, data=init_payload)
-        res_data = res.json()
+        if post_type == "Facebook Reel (Short)":
+            add_log(f"Initiating Facebook Reel upload for {os.path.basename(video_path)}...")
+            init_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
+            init_payload = {"upload_phase": "start", "access_token": access_token}
+            res = requests.post(init_url, data=init_payload)
+            res_data = res.json()
 
-        if "video_id" not in res_data or "upload_url" not in res_data:
-            add_log(f"FB Init Failed: {res_data}")
-            return False, f"Initialization Failed: {res_data}"
+            if "video_id" not in res_data or "upload_url" not in res_data:
+                add_log(f"FB Reel Init Failed: {res_data}")
+                return False, f"Reel Init Failed: {res_data}"
 
-        video_id = res_data["video_id"]
-        upload_url = res_data["upload_url"]
-        file_size = os.path.getsize(video_path)
+            video_id = res_data["video_id"]
+            upload_url = res_data["upload_url"]
+            file_size = os.path.getsize(video_path)
 
-        with open(video_path, "rb") as video_file:
-            headers = {"Authorization": f"OAuth {access_token}", "offset": "0", "file_size": str(file_size)}
-            requests.post(upload_url, data=video_file, headers=headers)
+            with open(video_path, "rb") as video_file:
+                headers = {"Authorization": f"OAuth {access_token}", "offset": "0", "file_size": str(file_size)}
+                requests.post(upload_url, data=video_file, headers=headers)
 
-        publish_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
-        publish_payload = {
-            "access_token": access_token,
-            "video_id": video_id,
-            "upload_phase": "finish",
-            "video_state": "PUBLISHED",
-            "description": caption
-        }
-        pub_res = requests.post(publish_url, data=publish_payload)
-        pub_data = pub_res.json()
+            publish_url = f"https://graph.facebook.com/v19.0/{page_id}/video_reels"
+            publish_payload = {
+                "access_token": access_token,
+                "video_id": video_id,
+                "upload_phase": "finish",
+                "video_state": "PUBLISHED",
+                "description": caption
+            }
+            pub_res = requests.post(publish_url, data=publish_payload)
+            pub_data = pub_res.json()
 
-        if pub_data.get("success", False):
-            add_log(f"Successfully published {os.path.basename(video_path)} to Facebook!")
-            return True, "Reel successfully published!"
-        else:
-            add_log(f"FB Publish Failed: {pub_data}")
-            return False, f"Publish Error: {pub_data}"
+            if pub_data.get("success", False):
+                add_log(f"Successfully published Reel: {os.path.basename(video_path)}")
+                return True, "Facebook Reel successfully published! 🚀"
+            else:
+                add_log(f"FB Reel Publish Failed: {pub_data}")
+                return False, f"Publish Error: {pub_data}"
+
+        else:  # Normal Video Post
+            add_log(f"Initiating Normal Page Video upload for {os.path.basename(video_path)}...")
+            upload_url = f"https://graph-video.facebook.com/v19.0/{page_id}/videos"
+            
+            with open(video_path, "rb") as video_file:
+                files_payload = {"source": video_file}
+                data_payload = {
+                    "access_token": access_token,
+                    "description": caption
+                }
+                res = requests.post(upload_url, data=data_payload, files=files_payload)
+                res_data = res.json()
+
+                if "id" in res_data:
+                    add_log(f"Successfully published Video Post: {os.path.basename(video_path)}")
+                    return True, "Normal Video post successfully published! 🚀"
+                else:
+                    add_log(f"FB Video Post Failed: {res_data}")
+                    return False, f"Video Post Error: {res_data}"
+
     except Exception as e:
         add_log(f"FB Exception: {str(e)}")
         return False, str(e)
 
 
-def background_hourly_poster(clips_list, page_id, access_token, caption):
-    """Background worker thread that posts clips one by one every 1 hour (3600s)."""
+def background_hourly_poster(clips_list, page_id, access_token, caption, post_type):
     st.session_state.queue_status = "Running 🟢"
-    add_log("Background hourly publishing queue started...")
+    add_log(f"Background hourly publishing queue started for {post_type}...")
     
     for idx, clip in enumerate(clips_list):
         add_log(f"Queue item {idx+1}/{len(clips_list)}: Waiting to publish {os.path.basename(clip)}...")
         
-        # If it's not the very first clip, wait for 1 hour (3600 seconds)
-        # Note: For testing purposes you can temporarily lower this, but 3600 = 1 hour
         if idx > 0:
-            wait_time = 3600 
+            wait_time = 3600  # 1 hour
             elapsed = 0
             while elapsed < wait_time:
-                time.sleep(60) # check every minute
+                time.sleep(60)
                 elapsed += 60
-                # st.session_state.queue_status = f"Waiting ({int((wait_time-elapsed)/60)} mins left)..."
 
-        success, msg = publish_to_facebook_reel(clip, page_id, access_token, f"{caption} (Part {idx+1})")
+        success, msg = publish_to_facebook(clip, page_id, access_token, f"{caption} (Part {idx+1})", post_type)
         if not success:
             add_log(f"Failed to auto-post {os.path.basename(clip)}: {msg}")
             
@@ -252,8 +274,8 @@ def background_hourly_poster(clips_list, page_id, access_token, caption):
 
 st.markdown("""
     <div style="padding: 10px 0; border-bottom: 1px solid #30363d; margin-bottom: 25px;">
-        <h1 style="color: #c9d1d9; margin: 0; font-size: 28px;">🎬 Pro Video Studio & Hourly Auto-Poster</h1>
-        <p style="color: #8b949e; margin: 5px 0 0 0;">Split videos & schedule automated 1-hour interval postings to Facebook.</p>
+        <h1 style="color: #c9d1d9; margin: 0; font-size: 28px;">🎬 Pro Video Studio & Facebook Publisher</h1>
+        <p style="color: #8b949e; margin: 5px 0 0 0;">Split videos & choose to post either as Reels or Normal Videos to Facebook.</p>
     </div>
 """, unsafe_allow_html=True)
 
@@ -274,10 +296,17 @@ with st.sidebar:
     watermark_text = st.text_input("🏷️ Watermark", placeholder="@Channel")
 
     st.markdown("---")
-    st.markdown("### 📘 Facebook Auto-Post Setup")
+    st.markdown("### 📘 Facebook Settings")
     fb_page_id = st.text_input("Facebook Page ID", placeholder="e.g. 1092837465")
     fb_access_token = st.text_input("Page Access Token", type="password", placeholder="EAAG...")
-    default_caption = st.text_area("Default Reel Caption", value="Check out this amazing reel! 🔥 #Reels")
+    
+    # NEW: Toggle between Reel or Normal Video post type
+    fb_post_type = st.selectbox(
+        "Select Facebook Post Type",
+        ["Facebook Reel (Short)", "Normal Page Video Post"]
+    )
+    
+    default_caption = st.text_area("Default Caption", value="Check out this amazing clip! 🔥")
 
 
 # Handle file upload persistence
@@ -359,21 +388,19 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
     # Output Gallery & Hourly Scheduler Queue Trigger
     if st.session_state.clips:
         st.markdown("---")
-        st.markdown("### 📦 Generated Clips & Hourly Automation Queue")
+        st.markdown(f"### 📦 Generated Clips & Auto-Posting Hub ({fb_post_type})")
         
-        # Hourly Automation Scheduler Trigger Button
-        if st.button("⏰ Start 1-Hour Interval Auto-Posting Queue for All Clips", type="primary", use_container_width=True):
+        if st.button(f"⏰ Start 1-Hour Interval Auto-Posting Queue ({fb_post_type})", type="primary", use_container_width=True):
             if not fb_page_id or not fb_access_token:
                 st.error("⚠️ Please enter Facebook Page ID and Access Token in the sidebar first!")
             else:
-                # Run background thread so UI doesn't freeze
                 bg_thread = threading.Thread(
                     target=background_hourly_poster,
-                    args=(st.session_state.clips, fb_page_id, fb_access_token, default_caption),
+                    args=(st.session_state.clips, fb_page_id, fb_access_token, default_caption, fb_post_type),
                     daemon=True
                 )
                 bg_thread.start()
-                st.success("✅ Hourly background queue started successfully! Check telemetry box for updates.")
+                st.success(f"✅ Hourly background queue started for {fb_post_type}!")
 
         st.markdown("<br>", unsafe_allow_html=True)
 
@@ -384,6 +411,7 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                     st.markdown(f"""
                         <div class="dashboard-card">
                             <h4>🎞️ {os.path.basename(clip)}</h4>
+                            <p style="color: #8b949e; font-size: 12px; margin: 0;">Mode: {fb_post_type}</p>
                         </div>
                     """, unsafe_allow_html=True)
                     st.video(clip)
@@ -397,12 +425,12 @@ if st.session_state.input_file and os.path.exists(st.session_state.input_file):
                             key=f"dl_clip_{idx}"
                         )
                     
-                    if st.button(f"🚀 Publish Instantly (Reel #{idx+1})", key=f"fb_post_{idx}", type="secondary"):
+                    if st.button(f"🚀 Publish Instantly as {fb_post_type} (Part #{idx+1})", key=f"fb_post_{idx}", type="secondary"):
                         if not fb_page_id or not fb_access_token:
                             st.error("⚠️ Please enter Facebook Page ID and Access Token in the sidebar!")
                         else:
-                            with st.spinner(f"Publishing {os.path.basename(clip)} to Facebook..."):
-                                success, msg = publish_to_facebook_reel(clip, fb_page_id, fb_access_token, default_caption)
+                            with st.spinner(f"Publishing to Facebook as {fb_post_type}..."):
+                                success, msg = publish_to_facebook(clip, fb_page_id, fb_access_token, default_caption, fb_post_type)
                                 if success:
                                     st.success(msg)
                                 else:
