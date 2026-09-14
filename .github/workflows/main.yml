@@ -8,28 +8,18 @@ publish-one-video:
 runs-on: ubuntu-latest
 
 ```
-env:
-  ONEDRIVE_USER: my@011999.onmicrosoft.com
-  GRAPH_BASE: https://graph.microsoft.com/v1.0
-
 steps:
-
-  # ==================================================
-  # 1. GET MICROSOFT GRAPH TOKEN
-  # ==================================================
   - name: Get Microsoft Graph token
     env:
       TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
       CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
       CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
-    shell: bash
     run: |
-      set -euo pipefail
+      set -e
 
       echo "Getting Microsoft Graph token..."
 
       curl -sS \
-        --fail-with-body \
         -X POST \
         "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
         -H "Content-Type: application/x-www-form-urlencoded" \
@@ -46,11 +36,11 @@ steps:
       with open("token_response.json", "r", encoding="utf-8") as f:
           data = json.load(f)
 
-      token = data.get("access_token")
+      token = data.get("access_token", "")
 
       if not token:
-          print("ERROR: Microsoft Graph token missing.")
-          print(json.dumps(data, indent=2))
+          print("ERROR: Graph token was not received.")
+          print(data)
           sys.exit(1)
 
       with open("graph_token.txt", "w", encoding="utf-8") as f:
@@ -62,26 +52,20 @@ steps:
       echo "GRAPH_TOKEN=$(cat graph_token.txt)" >> "$GITHUB_ENV"
 
 
-  # ==================================================
-  # 2. PREPARE FOLDERS
-  # ==================================================
   - name: Prepare folders
-    shell: bash
     run: |
-      set -euo pipefail
+      set -e
 
       mkdir -p pending_files
 
-      echo "Working folder ready."
+      echo "Working folder created."
 
 
-  # ==================================================
-  # 3. LIST PENDING_POSTS
-  # ==================================================
   - name: List Pending_Posts
-    shell: bash
+    env:
+      GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
     run: |
-      set -euo pipefail
+      set -e
 
       echo "Reading Pending_Posts..."
 
@@ -89,12 +73,12 @@ steps:
         -o pending_list.json \
         -w "%{http_code}" \
         -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-        "${GRAPH_BASE}/users/${ONEDRIVE_USER}/drive/root:/Pending_Posts:/children")
+        "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts:/children")
 
-      echo "Graph HTTP status: ${HTTP_CODE}"
+      echo "HTTP status: ${HTTP_CODE}"
 
       if [ "${HTTP_CODE}" != "200" ]; then
-        echo "ERROR: Pending_Posts could not be read."
+        echo "ERROR: Could not read Pending_Posts."
         cat pending_list.json
         exit 1
       fi
@@ -108,10 +92,10 @@ steps:
 
       items = data.get("value", [])
 
-      print(f"Pending_Posts contains {len(items)} item(s).")
+      print("Files found:", len(items))
 
       if not items:
-          print("No pending files found.")
+          print("No files found in Pending_Posts.")
           sys.exit(1)
 
       for item in items:
@@ -119,13 +103,9 @@ steps:
       PY
 
 
-  # ==================================================
-  # 4. FIND AND DOWNLOAD METADATA
-  # ==================================================
   - name: Download metadata
-    shell: bash
     run: |
-      set -euo pipefail
+      set -e
 
       python - <<'PY'
       import json
@@ -147,17 +127,17 @@ steps:
               break
 
       if metadata is None:
-          print("ERROR: No metadata JSON found.")
+          print("ERROR: Metadata JSON not found.")
           sys.exit(1)
 
       name = metadata["name"]
       url = metadata.get("@microsoft.graph.downloadUrl")
 
       if not url:
-          print("ERROR: Metadata download URL missing.")
+          print("ERROR: Metadata download URL not found.")
           sys.exit(1)
 
-      print("Metadata:", name)
+      print("Downloading:", name)
 
       subprocess.run(
           [
@@ -175,13 +155,9 @@ steps:
       PY
 
 
-  # ==================================================
-  # 5. READ METADATA
-  # ==================================================
   - name: Read metadata
-    shell: bash
     run: |
-      set -euo pipefail
+      set -e
 
       python - <<'PY'
       import glob
@@ -191,7 +167,7 @@ steps:
       files = glob.glob("pending_files/*_metadata.json")
 
       if not files:
-          print("ERROR: Metadata file not found.")
+          print("ERROR: Metadata file missing.")
           sys.exit(1)
 
       metadata_file = files[0]
@@ -199,12 +175,8 @@ steps:
       with open(metadata_file, "r", encoding="utf-8") as f:
           data = json.load(f)
 
-      print("Metadata loaded successfully.")
-
       caption = str(data.get("caption", ""))
       post_type = str(data.get("post_type", "Video"))
-
-      page_id = str(data.get("facebook_page_id", ""))
 
       with open("post_caption.txt", "w", encoding="utf-8") as f:
           f.write(caption)
@@ -212,22 +184,14 @@ steps:
       with open("post_type.txt", "w", encoding="utf-8") as f:
           f.write(post_type)
 
-      with open("metadata_page_id.txt", "w", encoding="utf-8") as f:
-          f.write(page_id)
-
       print("Post type:", post_type)
       print("Caption available:", bool(caption))
-      print("Metadata Page ID available:", bool(page_id))
       PY
 
 
-  # ==================================================
-  # 6. FIND FIRST MP4
-  # ==================================================
-  - name: Select first pending video
-    shell: bash
+  - name: Select first video
     run: |
-      set -euo pipefail
+      set -e
 
       python - <<'PY'
       import json
@@ -238,13 +202,11 @@ steps:
 
       items = data.get("value", [])
 
-      videos = []
-
-      for item in items:
-          name = item.get("name", "")
-
-          if name.lower().endswith(".mp4"):
-              videos.append(item)
+      videos = [
+          item
+          for item in items
+          if item.get("name", "").lower().endswith(".mp4")
+      ]
 
       videos.sort(key=lambda x: x.get("name", ""))
 
@@ -258,16 +220,8 @@ steps:
       item_id = video.get("id", "")
       url = video.get("@microsoft.graph.downloadUrl", "")
 
-      if not name:
-          print("ERROR: Video name missing.")
-          sys.exit(1)
-
-      if not item_id:
-          print("ERROR: Video item ID missing.")
-          sys.exit(1)
-
-      if not url:
-          print("ERROR: Video download URL missing.")
+      if not name or not item_id or not url:
+          print("ERROR: Video information is incomplete.")
           sys.exit(1)
 
       with open("selected_video.txt", "w", encoding="utf-8") as f:
@@ -280,22 +234,17 @@ steps:
           f.write(url)
 
       print("Selected video:", name)
-      print("Item ID found: YES")
       PY
 
 
-  # ==================================================
-  # 7. DOWNLOAD VIDEO
-  # ==================================================
-  - name: Download selected video
-    shell: bash
+  - name: Download video
     run: |
-      set -euo pipefail
+      set -e
 
       VIDEO=$(cat selected_video.txt)
       URL=$(cat selected_download_url.txt)
 
-      echo "Downloading:"
+      echo "Downloading video:"
       echo "${VIDEO}"
 
       curl -L \
@@ -305,33 +254,29 @@ steps:
         -o "pending_files/${VIDEO}"
 
       if [ ! -s "pending_files/${VIDEO}" ]; then
-        echo "ERROR: Downloaded video is empty."
+        echo "ERROR: Video download failed."
         exit 1
       fi
 
-      echo "Video downloaded successfully."
-
       ls -lh "pending_files/${VIDEO}"
 
+      echo "Video downloaded successfully."
 
-  # ==================================================
-  # 8. CHECK FACEBOOK SECRETS
-  # ==================================================
-  - name: Check Facebook configuration
+
+  - name: Check Facebook secrets
     env:
       FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
       FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
-    shell: bash
     run: |
-      set -euo pipefail
+      set -e
 
       if [ -z "${FACEBOOK_PAGE_ID}" ]; then
-        echo "ERROR: FACEBOOK_PAGE_ID secret is empty."
+        echo "ERROR: FACEBOOK_PAGE_ID is empty."
         exit 1
       fi
 
       if [ -z "${FACEBOOK_PAGE_ACCESS_TOKEN}" ]; then
-        echo "ERROR: FACEBOOK_PAGE_ACCESS_TOKEN secret is empty."
+        echo "ERROR: FACEBOOK_PAGE_ACCESS_TOKEN is empty."
         exit 1
       fi
 
@@ -339,16 +284,12 @@ steps:
       echo "Facebook Access Token: available"
 
 
-  # ==================================================
-  # 9. PUBLISH ONE VIDEO TO FACEBOOK
-  # ==================================================
   - name: Publish video to Facebook
     env:
       FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
       FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
-    shell: bash
     run: |
-      set -euo pipefail
+      set -e
 
       VIDEO=$(cat selected_video.txt)
       CAPTION=$(cat post_caption.txt)
@@ -370,9 +311,11 @@ steps:
 
       echo "Facebook HTTP status: ${HTTP_CODE}"
 
+      echo "Facebook response:"
+      cat facebook_response.json
+
       if [ "${HTTP_CODE}" -lt 200 ] || [ "${HTTP_CODE}" -ge 300 ]; then
         echo "ERROR: Facebook API request failed."
-        cat facebook_response.json
         exit 1
       fi
 
@@ -384,32 +327,30 @@ steps:
           data = json.load(f)
 
       if "error" in data:
-          print("ERROR: Facebook returned an API error.")
-          print(json.dumps(data, indent=2))
+          print("Facebook API error:")
+          print(data)
           sys.exit(1)
 
       video_id = data.get("id", "")
 
       if not video_id:
           print("ERROR: Facebook video ID not found.")
-          print(json.dumps(data, indent=2))
+          print(data)
           sys.exit(1)
 
       with open("facebook_video_id.txt", "w", encoding="utf-8") as f:
           f.write(video_id)
 
       print("Facebook publish successful.")
-      print("Facebook Video ID:", video_id)
+      print("Video ID:", video_id)
       PY
 
 
-  # ==================================================
-  # 10. FIND OR CREATE POSTED FOLDER
-  # ==================================================
   - name: Find or create Posted folder
-    shell: bash
+    env:
+      GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
     run: |
-      set -euo pipefail
+      set -e
 
       echo "Checking Posted folder..."
 
@@ -417,7 +358,7 @@ steps:
         -o posted_response.json \
         -w "%{http_code}" \
         -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-        "${GRAPH_BASE}/users/${ONEDRIVE_USER}/drive/root:/Posted")
+        "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Posted")
 
       echo "Posted folder HTTP status: ${HTTP_CODE}"
 
@@ -433,13 +374,13 @@ steps:
       folder_id = data.get("id", "")
 
       if not folder_id:
-          print("ERROR: Posted folder ID missing.")
+          print("ERROR: Posted folder ID not found.")
           sys.exit(1)
 
       with open("posted_folder_id.txt", "w", encoding="utf-8") as f:
           f.write(folder_id)
 
-      print("Posted folder already exists.")
+      print("Posted folder found.")
       PY
 
       elif [ "${HTTP_CODE}" = "404" ]; then
@@ -454,9 +395,9 @@ steps:
           -H "Authorization: Bearer ${GRAPH_TOKEN}" \
           -H "Content-Type: application/json" \
           -d '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
-          "${GRAPH_BASE}/users/${ONEDRIVE_USER}/drive/root/children")
+          "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children")
 
-        echo "Create folder HTTP status: ${CREATE_CODE}"
+        echo "Create HTTP status: ${CREATE_CODE}"
 
         if [ "${CREATE_CODE}" != "201" ]; then
           echo "ERROR: Posted folder creation failed."
@@ -474,7 +415,7 @@ steps:
       folder_id = data.get("id", "")
 
       if not folder_id:
-          print("ERROR: New Posted folder ID missing.")
+          print("ERROR: Created folder ID not found.")
           sys.exit(1)
 
       with open("posted_folder_id.txt", "w", encoding="utf-8") as f:
@@ -485,7 +426,7 @@ steps:
 
       else
 
-        echo "ERROR: Unexpected response while finding Posted folder."
+        echo "ERROR: Unexpected Graph response."
         cat posted_response.json
         exit 1
 
@@ -503,13 +444,12 @@ steps:
       echo "Posted folder ready."
 
 
-  # ==================================================
-  # 11. MOVE VIDEO FROM PENDING TO POSTED
-  # ==================================================
   - name: Move video to Posted
-    shell: bash
+    env:
+      GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+      POSTED_FOLDER_ID: ${{ env.POSTED_FOLDER_ID }}
     run: |
-      set -euo pipefail
+      set -e
 
       ITEM_ID=$(cat selected_item_id.txt)
       VIDEO=$(cat selected_video.txt)
@@ -517,30 +457,13 @@ steps:
       echo "Moving video:"
       echo "${VIDEO}"
 
-      python - <<'PY'
-      import json
-      import os
-
-      item_id = open("selected_item_id.txt", encoding="utf-8").read().strip()
-      folder_id = os.environ["POSTED_FOLDER_ID"]
-
-      body = {
-          "parentReference": {
-              "id": folder_id
-          }
-      }
-
-      with open("move_body.json", "w", encoding="utf-8") as f:
-          json.dump(body, f)
-
-      print("Move request prepared.")
-      PY
+      printf '{"parentReference":{"id":"%s"}}' "${POSTED_FOLDER_ID}" > move_body.json
 
       MOVE_CODE=$(curl -sS \
         -o move_response.json \
         -w "%{http_code}" \
         -X PATCH \
-        "${GRAPH_BASE}/users/${ONEDRIVE_USER}/drive/items/${ITEM_ID}" \
+        "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${ITEM_ID}" \
         -H "Authorization: Bearer ${GRAPH_TOKEN}" \
         -H "Content-Type: application/json" \
         --data-binary @move_body.json)
@@ -553,60 +476,25 @@ steps:
         exit 1
       fi
 
-      python - <<'PY'
-      import json
-      import sys
-
-      with open("move_response.json", "r", encoding="utf-8") as f:
-          data = json.load(f)
-
-      moved_id = data.get("id", "")
-
-      if not moved_id:
-          print("ERROR: Move response does not contain item ID.")
-          sys.exit(1)
-
-      print("Video moved successfully.")
-      print("Moved item ID:", moved_id)
-      PY
+      echo "Video moved to Posted successfully."
 
 
-  # ==================================================
-  # 12. FINAL RESULT
-  # ==================================================
   - name: Final result
-    shell: bash
     run: |
       echo ""
-      echo "=============================================="
-      echo "       FACEBOOK AUTO POST TEST SUCCESS"
-      echo "=============================================="
+      echo "=========================================="
+      echo "       FACEBOOK AUTO POST TEST"
+      echo "=========================================="
       echo ""
-
       echo "Video:"
       cat selected_video.txt
-
       echo ""
-
       echo "Facebook Video ID:"
       cat facebook_video_id.txt
-
       echo ""
-
-      echo "OneDrive destination:"
-      echo "Posted"
-
-      echo ""
-      echo "Pipeline:"
-      echo "Pending_Posts"
-      echo "      ↓"
-      echo "GitHub Actions"
-      echo "      ↓"
-      echo "Facebook Page"
-      echo "      ↓"
-      echo "Posted"
-
+      echo "OneDrive:"
+      echo "Pending_Posts -> Posted"
       echo ""
       echo "STATUS: SUCCESS"
-      echo "=============================================="
+      echo "=========================================="
 ```
