@@ -1,15 +1,14 @@
-name: OneDrive Upload Test
+name: OneDrive Drive Test
 
 on:
   workflow_dispatch:
 
 jobs:
-  test-onedrive:
+  test-drive:
     runs-on: ubuntu-latest
 
     steps:
       - name: Get Microsoft Graph token
-        id: token
         env:
           TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
           CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
@@ -23,30 +22,29 @@ jobs:
             --data-urlencode "scope=https://graph.microsoft.com/.default" \
             --data-urlencode "grant_type=client_credentials")
 
-          echo "$RESPONSE" > token_response.json
+          TOKEN=$(python -c "import json; print(json.loads('''$RESPONSE''').get('access_token',''))")
 
-          if ! grep -q '"access_token"' token_response.json; then
-            echo "ERROR: Microsoft Graph token could not be obtained."
-            cat token_response.json
+          if [ -z "$TOKEN" ]; then
+            echo "ERROR: Could not get Graph token."
+            echo "$RESPONSE"
             exit 1
           fi
 
-          TOKEN=$(python -c "import json; print(json.load(open('token_response.json'))['access_token'])")
           echo "GRAPH_TOKEN=$TOKEN" >> "$GITHUB_ENV"
+          echo "Graph token obtained."
 
-          echo "Microsoft Graph token obtained successfully."
-
-      - name: Find Pending_Posts folder
+      - name: Test OneDrive
         run: |
-          RESPONSE=$(curl -s \
+          curl -s \
             -H "Authorization: Bearer $GRAPH_TOKEN" \
-            "https://graph.microsoft.com/v1.0/users/${{ secrets.ONEDRIVE_USER_ID }}/drive/root:/Pending_Posts")
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive" \
+            -o drive.json
 
-          echo "$RESPONSE"
+          cat drive.json
 
-          if echo "$RESPONSE" | grep -q '"id"'; then
-            echo "Pending_Posts folder found."
+          if grep -q '"id"' drive.json; then
+            echo "SUCCESS: OneDrive drive found."
           else
-            echo "ERROR: Pending_Posts folder not found."
+            echo "ERROR: Could not access this user's OneDrive."
             exit 1
           fi
