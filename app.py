@@ -1,7 +1,5 @@
 import os
 import json
-import math
-import time
 import tempfile
 import subprocess
 from pathlib import Path
@@ -17,7 +15,7 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="Pro Video Studio | Hybrid OneDrive",
+    page_title="Pro Video Studio",
     page_icon="🎬",
     layout="wide"
 )
@@ -34,7 +32,6 @@ GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 
 ONEDRIVE_FOLDER = "Pending_Posts"
 
-# 5 MiB = exact multiple of 320 KiB
 CHUNK_SIZE = 5 * 1024 * 1024
 
 MAX_STREAMLIT_UPLOAD_SIZE_MB = 2048
@@ -60,12 +57,6 @@ st.markdown(
         margin-bottom: 25px;
     }
 
-    .status-box {
-        padding: 15px;
-        border-radius: 10px;
-        margin: 10px 0;
-    }
-
     </style>
     """,
     unsafe_allow_html=True
@@ -88,35 +79,19 @@ st.markdown(
 
 
 # ============================================================
-# SESSION STATE
-# ============================================================
-
-if "onedrive_access_token" not in st.session_state:
-    st.session_state.onedrive_access_token = None
-
-if "onedrive_drive_id" not in st.session_state:
-    st.session_state.onedrive_drive_id = None
-
-if "onedrive_connected" not in st.session_state:
-    st.session_state.onedrive_connected = False
-
-
-# ============================================================
 # AZURE / MICROSOFT GRAPH AUTHENTICATION
 # ============================================================
 
 def get_application_access_token():
-    """
-    Gets Microsoft Graph application token using
-    credentials stored in Streamlit Secrets.
-    """
 
     try:
+
         client_id = st.secrets["AZURE_CLIENT_ID"]
         tenant_id = st.secrets["AZURE_TENANT_ID"]
         client_secret = st.secrets["AZURE_CLIENT_SECRET"]
 
     except Exception:
+
         st.error(
             """
             ❌ Azure credentials Streamlit Secrets me configured nahi hain.
@@ -128,6 +103,7 @@ def get_application_access_token():
             - AZURE_CLIENT_SECRET
             """
         )
+
         st.stop()
 
     authority = (
@@ -135,7 +111,7 @@ def get_application_access_token():
     )
 
     confidential_app = msal.ConfidentialClientApplication(
-        client_id=client_id,
+        client_id,
         authority=authority,
         client_credential=client_secret
     )
@@ -160,10 +136,11 @@ def get_application_access_token():
 
 
 # ============================================================
-# GRAPH REQUEST HELPER
+# GRAPH HEADERS
 # ============================================================
 
 def graph_headers(access_token):
+
     return {
         "Authorization": f"Bearer {access_token}"
     }
@@ -199,30 +176,7 @@ def get_onedrive_drive(access_token):
 
 
 # ============================================================
-# GET DRIVE ID
-# ============================================================
-
-def get_onedrive_drive_id(access_token):
-
-    if st.session_state.onedrive_drive_id:
-        return st.session_state.onedrive_drive_id
-
-    drive = get_onedrive_drive(access_token)
-
-    drive_id = drive.get("id")
-
-    if not drive_id:
-        raise Exception(
-            "OneDrive Drive ID nahi mila."
-        )
-
-    st.session_state.onedrive_drive_id = drive_id
-
-    return drive_id
-
-
-# ============================================================
-# CHECK / CREATE FOLDER
+# ENSURE PENDING_POSTS FOLDER
 # ============================================================
 
 def ensure_pending_posts_folder(access_token):
@@ -340,7 +294,7 @@ def upload_small_file(
 
 
 # ============================================================
-# LARGE FILE UPLOAD SESSION
+# CREATE LARGE FILE UPLOAD SESSION
 # ============================================================
 
 def create_upload_session(
@@ -395,6 +349,7 @@ def create_upload_session(
     upload_url = data.get("uploadUrl")
 
     if not upload_url:
+
         raise Exception(
             "Upload session URL nahi mila."
         )
@@ -511,74 +466,12 @@ def upload_file_to_onedrive(
 
 
 # ============================================================
-# CONNECT ONEDRIVE
-# ============================================================
-
-def connect_onedrive():
-
-    try:
-
-        with st.spinner(
-            "🔐 Microsoft Graph se connect ho raha hai..."
-        ):
-
-            token = get_application_access_token()
-
-            drive = get_onedrive_drive(token)
-
-            ensure_pending_posts_folder(token)
-
-            st.session_state.onedrive_access_token = token
-            st.session_state.onedrive_drive_id = drive["id"]
-            st.session_state.onedrive_connected = True
-
-        return True
-
-    except Exception as e:
-
-        st.session_state.onedrive_connected = False
-
-        st.error(
-            f"❌ OneDrive connection failed:\n\n{e}"
-        )
-
-        return False
-
-
-# ============================================================
-# SIDEBAR
+# VIDEO SETTINGS
 # ============================================================
 
 with st.sidebar:
 
     st.header("⚙️ Settings")
-
-    st.subheader("☁️ OneDrive")
-
-    if st.session_state.onedrive_connected:
-
-        st.success(
-            "✅ OneDrive Connected"
-        )
-
-        st.caption(
-            f"Folder: {ONEDRIVE_FOLDER}"
-        )
-
-    else:
-
-        st.warning(
-            "OneDrive not connected"
-        )
-
-    if st.button(
-        "🔗 Connect OneDrive",
-        use_container_width=True
-    ):
-
-        connect_onedrive()
-
-    st.divider()
 
     st.subheader("🎞️ Video Settings")
 
@@ -605,28 +498,6 @@ with st.sidebar:
         value=""
     )
 
-    st.divider()
-
-    st.subheader("📘 Facebook Metadata")
-
-    facebook_page_id = st.text_input(
-        "Facebook Page ID",
-        value=""
-    )
-
-    post_type = st.selectbox(
-        "Post Type",
-        [
-            "Video",
-            "Reel"
-        ]
-    )
-
-    caption = st.text_area(
-        "Caption",
-        value=""
-    )
-
 
 # ============================================================
 # MAIN UPLOAD
@@ -647,7 +518,7 @@ uploaded_video = st.file_uploader(
 
 
 # ============================================================
-# VIDEO PROCESSING FUNCTIONS
+# VIDEO DURATION
 # ============================================================
 
 def get_video_duration(file_path):
@@ -671,6 +542,7 @@ def get_video_duration(file_path):
     )
 
     if result.returncode != 0:
+
         raise Exception(
             "FFprobe video duration read nahi kar paaya."
         )
@@ -679,6 +551,10 @@ def get_video_duration(file_path):
         result.stdout.strip()
     )
 
+
+# ============================================================
+# SPLIT VIDEO
+# ============================================================
 
 def split_video(
     input_file,
@@ -760,14 +636,6 @@ if uploaded_video:
 
     if process_button:
 
-        if not st.session_state.onedrive_connected:
-
-            st.warning(
-                "⚠️ Pehle **Connect OneDrive** button click karein."
-            )
-
-            st.stop()
-
         temp_root = tempfile.mkdtemp(
             prefix="video_studio_"
         )
@@ -784,9 +652,33 @@ if uploaded_video:
 
         try:
 
-            # ------------------------------------------------
+            # =================================================
+            # CONNECT TO ONEDRIVE AUTOMATICALLY
+            # =================================================
+
+            with st.spinner(
+                "🔐 OneDrive se connect ho raha hai..."
+            ):
+
+                access_token = (
+                    get_application_access_token()
+                )
+
+                get_onedrive_drive(
+                    access_token
+                )
+
+                ensure_pending_posts_folder(
+                    access_token
+                )
+
+            st.success(
+                "🟢 OneDrive connected"
+            )
+
+            # =================================================
             # SAVE ORIGINAL VIDEO
-            # ------------------------------------------------
+            # =================================================
 
             with open(
                 input_path,
@@ -802,9 +694,9 @@ if uploaded_video:
                 "Processing start ho raha hai..."
             )
 
-            # ------------------------------------------------
+            # =================================================
             # VIDEO DURATION
-            # ------------------------------------------------
+            # =================================================
 
             duration = get_video_duration(
                 input_path
@@ -815,9 +707,9 @@ if uploaded_video:
                 f"{duration:.2f} seconds"
             )
 
-            # ------------------------------------------------
+            # =================================================
             # SPLIT VIDEO
-            # ------------------------------------------------
+            # =================================================
 
             with st.spinner(
                 "✂️ Video split ho raha hai..."
@@ -839,9 +731,9 @@ if uploaded_video:
                 f"✅ {len(clips)} clips generate hui."
             )
 
-            # ------------------------------------------------
+            # =================================================
             # UPLOAD CLIPS
-            # ------------------------------------------------
+            # =================================================
 
             st.subheader(
                 "☁️ Uploading to OneDrive"
@@ -861,9 +753,6 @@ if uploaded_video:
 
                 clip_number = index + 1
 
-                original_name = clip_path.name
-
-                # Safe filename
                 final_name = (
                     f"{Path(uploaded_video.name).stem}"
                     f"_clip_{clip_number:03d}.mp4"
@@ -888,7 +777,7 @@ if uploaded_video:
                     )
 
                 upload_file_to_onedrive(
-                    st.session_state.onedrive_access_token,
+                    access_token,
                     str(clip_path),
                     final_name,
                     update_progress
@@ -900,15 +789,12 @@ if uploaded_video:
                     uploaded_count / total_clips
                 )
 
-            # ------------------------------------------------
+            # =================================================
             # METADATA JSON
-            # ------------------------------------------------
+            # =================================================
 
             metadata = {
                 "source_video": uploaded_video.name,
-                "post_type": post_type,
-                "facebook_page_id": facebook_page_id,
-                "caption": caption,
                 "total_clips": total_clips,
                 "clip_duration_seconds": clip_duration,
                 "aspect_ratio": aspect_ratio,
@@ -934,23 +820,23 @@ if uploaded_video:
                     ensure_ascii=False
                 )
 
-            # ------------------------------------------------
+            # =================================================
             # UPLOAD METADATA
-            # ------------------------------------------------
+            # =================================================
 
             status_text.write(
-                "⬆️ Uploading metadata.json..."
+                "⬆️ Uploading metadata..."
             )
 
             upload_file_to_onedrive(
-                st.session_state.onedrive_access_token,
+                access_token,
                 metadata_path,
                 f"{Path(uploaded_video.name).stem}_metadata.json"
             )
 
-            # ------------------------------------------------
+            # =================================================
             # COMPLETE
-            # ------------------------------------------------
+            # =================================================
 
             overall_progress.progress(
                 1.0
@@ -971,7 +857,7 @@ if uploaded_video:
             )
 
             st.info(
-                "GitHub Actions ab Pending_Posts folder "
+                "🤖 GitHub Actions ab Pending_Posts folder "
                 "se clips process/publish kar sakta hai."
             )
 
@@ -982,10 +868,6 @@ if uploaded_video:
             )
 
         finally:
-
-            # ------------------------------------------------
-            # CLEAN TEMP FILES
-            # ------------------------------------------------
 
             try:
 
@@ -998,23 +880,3 @@ if uploaded_video:
 
             except Exception:
                 pass
-
-
-# ============================================================
-# FOOTER / STATUS
-# ============================================================
-
-st.divider()
-
-if st.session_state.onedrive_connected:
-
-    st.success(
-        "🟢 OneDrive Ready — Pending_Posts folder active"
-    )
-
-else:
-
-    st.caption(
-        "🔴 OneDrive disconnected"
-    )
-
