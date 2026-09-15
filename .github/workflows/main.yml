@@ -1,10 +1,17 @@
-name: Facebook Auto Poster - Test
+name: Facebook Auto Poster - Sequential
 
 on:
   workflow_dispatch:
 
+  schedule:
+    - cron: "*/30 * * * *"
+
+concurrency:
+  group: facebook-auto-poster
+  cancel-in-progress: false
+
 jobs:
-  publish-one-video:
+  publish-next-video:
     runs-on: ubuntu-latest
 
     steps:
@@ -50,22 +57,13 @@ jobs:
           echo "GRAPH_TOKEN=$(cat graph_token.txt)" >> "$GITHUB_ENV"
 
 
-      - name: Prepare folders
-        run: |
-          set -e
-
-          mkdir -p pending_files
-
-          echo "Working directory prepared."
-
-
       - name: List Pending_Posts
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
           set -e
 
-          echo "Listing Pending_Posts..."
+          echo "Checking Pending_Posts..."
 
           curl -sS \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
@@ -79,7 +77,7 @@ jobs:
           echo "HTTP Status: ${HTTP_CODE}"
 
           if [ "${HTTP_CODE}" != "200" ]; then
-            echo "ERROR: Could not list Pending_Posts."
+            echo "ERROR: Could not read Pending_Posts."
             cat pending_list.json
             exit 1
           fi
@@ -92,112 +90,20 @@ jobs:
 
           items = data.get("value", [])
 
-          print("Files found in Pending_Posts:", len(items))
+          print("Items found:", len(items))
 
           for item in items:
-              print(
-                  item.get("name"),
-                  "|",
-                  item.get("id")
-              )
+              print(item.get("name", ""))
           PY
 
 
-      - name: Find metadata file
+      - name: Select next video and matching metadata
         run: |
           set -e
 
           python - <<'PY'
           import json
-
-          with open("pending_list.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          items = data.get("value", [])
-
-          metadata = None
-
-          for item in items:
-              name = item.get("name", "")
-
-              if name.lower().endswith("_metadata.json"):
-                  metadata = item
-                  break
-
-          if metadata is None:
-              print("ERROR: No metadata JSON found.")
-              raise SystemExit(1)
-
-          print("Metadata file:")
-          print(metadata["name"])
-          print("Item ID:")
-          print(metadata["id"])
-
-          with open("metadata_item_id.txt", "w", encoding="utf-8") as f:
-              f.write(metadata["id"])
-
-          with open("metadata_download_url.txt", "w", encoding="utf-8") as f:
-              f.write(metadata["@microsoft.graph.downloadUrl"])
-          PY
-
-
-      - name: Download metadata
-        run: |
-          set -e
-
-          METADATA_URL=$(cat metadata_download_url.txt)
-
-          echo "Downloading metadata..."
-
-          curl -L --fail \
-            "${METADATA_URL}" \
-            -o metadata.json
-
-          echo "Metadata downloaded."
-
-          cat metadata.json
-
-
-      - name: Read metadata
-        run: |
-          set -e
-
-          python - <<'PY'
-          import json
-
-          with open("metadata.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          print("Metadata:")
-          print(json.dumps(data, indent=2, ensure_ascii=False))
-
-          caption = data.get("caption", "")
-
-          if not caption:
-              caption = data.get("description", "")
-
-          if not caption:
-              caption = "New video"
-
-          post_type = data.get("post_type", "video")
-
-          with open("post_caption.txt", "w", encoding="utf-8") as f:
-              f.write(caption)
-
-          with open("post_type.txt", "w", encoding="utf-8") as f:
-              f.write(post_type)
-
-          print("Caption loaded successfully.")
-          print("Post type:", post_type)
-          PY
-
-
-      - name: Select first video
-        run: |
-          set -e
-
-          python - <<'PY'
-          import json
+          import re
 
           with open("pending_list.json", "r", encoding="utf-8") as f:
               data = json.load(f)
@@ -209,59 +115,227 @@ jobs:
           for item in items:
               name = item.get("name", "")
 
-              if name.lower().endswith(".mp4"):
-                  videos.append(item)
+              if not name.lower().endswith(".mp4"):
+                  continue
+
+              match = re.search(r"_clip_(\d+)\.mp4$", name, re.IGNORECASE)
+
+              if match:
+                  part_number = int(match.group(1))
+              else:
+                  part_number = 999999
+
+              videos.append({
+                  "item": item,
+                  "part_number": part_number
+              })
 
           if not videos:
-              print("ERROR: No MP4 video found in Pending_Posts.")
-              raise SystemExit(1)
+              print("No pending MP4 videos found.")
+              print("Nothing to post.")
+              raise SystemExit(0)
 
-          videos.sort(key=lambda x: x.get("name", ""))
+          videos.sort(
+              key=lambda x: (
+                  x["item"].get("name", "").rsplit("_clip_", 1)[0],
+                  x["part_number"],
+                  x["item"].get("name", "")
+              )
+          )
 
-          video = videos[0]
+          selected = videos[0]["item"]
 
-          name = video["name"]
-          item_id = video["id"]
-          download_url = video.get("@microsoft.graph.downloadUrl")
+          video_name = selected["name"]
+          video_id = selected["id"]
+          video_url = selected.get("@microsoft.graph.downloadUrl")
 
-          if not download_url:
-              print("ERROR: Download URL not available.")
+          if not video_url:
+              print("ERROR: Video download URL not available.")
               raise SystemExit(1)
 
           print("Selected video:")
-          print(name)
+          print(video_name)
 
           print("Item ID:")
-          print(item_id)
+          print(video_id)
+
+          # Find source base name.
+          clip_match = re.match(
+              r"^(.*)_clip_(\d+)\.mp4$",
+              video_name,
+              re.IGNORECASE
+          )
+
+          if clip_match:
+              source_base = clip_match.group(1)
+              current_part = int(clip_match.group(2))
+          else:
+              source_base = video_name.rsplit(".", 1)[0]
+              current_part = 1
+
+          metadata_name = source_base + "_metadata.json"
+
+          print("Matching metadata:")
+          print(metadata_name)
+
+          metadata = None
+
+          for item in items:
+              if item.get("name", "").lower() == metadata_name.lower():
+                  metadata = item
+                  break
+
+          if metadata is None:
+              print("ERROR: Matching metadata file was not found.")
+              print("Expected:", metadata_name)
+              raise SystemExit(1)
+
+          total_parts = 0
+
+          for item in items:
+              item_name = item.get("name", "")
+
+              if item_name.lower().startswith(source_base.lower() + "_clip_") and item_name.lower().endswith(".mp4"):
+                  total_parts += 1
+
+          print("Current part:", current_part)
+          print("Total pending parts:", total_parts)
 
           with open("selected_video.txt", "w", encoding="utf-8") as f:
-              f.write(name)
+              f.write(video_name)
 
           with open("selected_item_id.txt", "w", encoding="utf-8") as f:
-              f.write(item_id)
+              f.write(video_id)
 
           with open("selected_download_url.txt", "w", encoding="utf-8") as f:
-              f.write(download_url)
+              f.write(video_url)
+
+          with open("selected_metadata_name.txt", "w", encoding="utf-8") as f:
+              f.write(metadata_name)
+
+          with open("selected_metadata_id.txt", "w", encoding="utf-8") as f:
+              f.write(metadata["id"])
+
+          with open("current_part.txt", "w", encoding="utf-8") as f:
+              f.write(str(current_part))
+
+          with open("total_parts.txt", "w", encoding="utf-8") as f:
+              f.write(str(total_parts))
+
+          with open("metadata_download_url.txt", "w", encoding="utf-8") as f:
+              f.write(metadata["@microsoft.graph.downloadUrl"])
           PY
 
 
-      - name: Download video
+      - name: Download matching metadata
+        run: |
+          set -e
+
+          METADATA_URL=$(cat metadata_download_url.txt)
+
+          echo "Downloading matching metadata..."
+
+          curl -L --fail \
+            "${METADATA_URL}" \
+            -o metadata.json
+
+          echo "Metadata downloaded."
+
+          cat metadata.json
+
+
+      - name: Build caption and hashtags
+        run: |
+          set -e
+
+          python - <<'PY'
+          import json
+          import re
+
+          with open("metadata.json", "r", encoding="utf-8") as f:
+              data = json.load(f)
+
+          caption = data.get("caption", "")
+
+          if not caption:
+              caption = data.get("description", "")
+
+          if not caption:
+              caption = "New video"
+
+          # Read hashtags from metadata if available.
+          hashtags = data.get("hashtags", "")
+
+          if not hashtags:
+              hashtags = data.get("tags", "")
+
+          if isinstance(hashtags, list):
+              hashtags = " ".join(str(x) for x in hashtags)
+
+          hashtags = str(hashtags).strip()
+
+          # If metadata has no hashtags, use default hashtags.
+          if not hashtags:
+              hashtags = "#viral #trending #shorts #reels"
+
+          # Make sure each tag starts with #.
+          tag_list = []
+
+          for tag in hashtags.replace(",", " ").split():
+              tag = tag.strip()
+
+              if not tag:
+                  continue
+
+              if not tag.startswith("#"):
+                  tag = "#" + tag
+
+              tag_list.append(tag)
+
+          hashtags = " ".join(tag_list)
+
+          current_part = int(open("current_part.txt", "r", encoding="utf-8").read().strip())
+          total_parts = int(open("total_parts.txt", "r", encoding="utf-8").read().strip())
+
+          part_text = f"Part {current_part}/{total_parts}"
+
+          final_caption = (
+              caption.strip()
+              + "\n\n"
+              + part_text
+              + "\n\n"
+              + hashtags
+          )
+
+          print("Final Facebook caption:")
+          print("--------------------------------")
+          print(final_caption)
+          print("--------------------------------")
+
+          with open("post_caption.txt", "w", encoding="utf-8") as f:
+              f.write(final_caption)
+          PY
+
+
+      - name: Download selected video
         run: |
           set -e
 
           VIDEO=$(cat selected_video.txt)
           VIDEO_URL=$(cat selected_download_url.txt)
 
-          echo "Downloading:"
+          mkdir -p pending_files
+
+          echo "Downloading selected video:"
           echo "${VIDEO}"
 
           curl -L --fail \
             "${VIDEO_URL}" \
             -o "pending_files/${VIDEO}"
 
-          echo "Video downloaded successfully."
+          echo "Video downloaded."
 
-          ls -lh pending_files/
+          ls -lh "pending_files/${VIDEO}"
 
 
       - name: Check Facebook secrets
@@ -284,7 +358,7 @@ jobs:
           echo "Facebook secrets are available."
 
 
-      - name: Publish video to Facebook
+      - name: Publish next part to Facebook
         env:
           FACEBOOK_PAGE_ID: ${{ secrets.FACEBOOK_PAGE_ID }}
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.FACEBOOK_PAGE_ACCESS_TOKEN }}
@@ -294,8 +368,16 @@ jobs:
           VIDEO=$(cat selected_video.txt)
           CAPTION=$(cat post_caption.txt)
 
-          echo "Publishing video to Facebook..."
-          echo "Video: ${VIDEO}"
+          echo "========================================"
+          echo "Publishing next Facebook part"
+          echo "========================================"
+
+          echo "Video:"
+          echo "${VIDEO}"
+
+          echo ""
+          echo "Caption:"
+          cat post_caption.txt
 
           curl -sS \
             -X POST \
@@ -309,13 +391,17 @@ jobs:
 
           FACEBOOK_HTTP_CODE=$(cat facebook_http_code.txt)
 
+          echo ""
           echo "Facebook HTTP Status: ${FACEBOOK_HTTP_CODE}"
 
+          echo ""
           echo "Facebook response:"
           cat facebook_response.json
 
           if [ "${FACEBOOK_HTTP_CODE}" -lt 200 ] || [ "${FACEBOOK_HTTP_CODE}" -ge 300 ]; then
+            echo ""
             echo "ERROR: Facebook upload failed."
+            echo "The video will remain in Pending_Posts."
             exit 1
           fi
 
@@ -332,7 +418,7 @@ jobs:
               print(data)
               raise SystemExit(1)
 
-          print("Facebook video ID:", video_id)
+          print("Facebook Video ID:", video_id)
 
           with open("facebook_video_id.txt", "w", encoding="utf-8") as f:
               f.write(video_id)
@@ -375,7 +461,7 @@ jobs:
               print(data)
               raise SystemExit(1)
 
-          print("Posted folder already exists.")
+          print("Posted folder found.")
           print("Folder ID:", folder_id)
 
           with open("posted_folder_id.txt", "w", encoding="utf-8") as f:
@@ -384,7 +470,8 @@ jobs:
 
           elif [ "${HTTP_CODE}" = "404" ]; then
 
-            echo "Posted folder does not exist. Creating it..."
+            echo "Posted folder does not exist."
+            echo "Creating Posted folder..."
 
             printf '%s' \
               '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
@@ -402,12 +489,11 @@ jobs:
 
             CREATE_HTTP_CODE=$(cat posted_create_http_code.txt)
 
-            echo "Create Posted HTTP Status: ${CREATE_HTTP_CODE}"
-
-            cat posted_folder_created.json
+            echo "Create folder HTTP Status: ${CREATE_HTTP_CODE}"
 
             if [ "${CREATE_HTTP_CODE}" -lt 200 ] || [ "${CREATE_HTTP_CODE}" -ge 300 ]; then
               echo "ERROR: Could not create Posted folder."
+              cat posted_folder_created.json
               exit 1
             fi
 
@@ -432,9 +518,11 @@ jobs:
           PY
 
           else
-            echo "ERROR: Unexpected response while finding Posted folder."
+
+            echo "ERROR: Unexpected Posted folder response."
             cat posted_folder.json
             exit 1
+
           fi
 
           POSTED_FOLDER_ID=$(cat posted_folder_id.txt)
@@ -444,7 +532,7 @@ jobs:
           echo "Posted folder ready."
 
 
-      - name: Move video to Posted
+      - name: Move successfully posted video to Posted
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
           POSTED_FOLDER_ID: ${{ env.POSTED_FOLDER_ID }}
@@ -454,11 +542,8 @@ jobs:
           ITEM_ID=$(cat selected_item_id.txt)
           VIDEO=$(cat selected_video.txt)
 
-          echo "Moving video:"
+          echo "Moving successfully posted video:"
           echo "${VIDEO}"
-
-          echo "Destination folder:"
-          echo "${POSTED_FOLDER_ID}"
 
           printf '%s' \
             "{\"parentReference\":{\"id\":\"${POSTED_FOLDER_ID}\"}}" \
@@ -479,7 +564,7 @@ jobs:
           echo "Move HTTP Status: ${MOVE_HTTP_CODE}"
 
           if [ "${MOVE_HTTP_CODE}" != "200" ]; then
-            echo "ERROR: Video could not be moved to Posted."
+            echo "ERROR: Facebook post succeeded but OneDrive move failed."
             cat move_response.json
             exit 1
           fi
@@ -489,23 +574,35 @@ jobs:
 
       - name: Final result
         run: |
+          echo ""
           echo "========================================"
-          echo "FACEBOOK AUTO POST TEST COMPLETED"
+          echo "FACEBOOK AUTO POST SUCCESS"
           echo "========================================"
 
           echo "Video:"
           cat selected_video.txt
 
           echo ""
+          echo "Part:"
+          cat current_part.txt
+
+          echo ""
+          echo "Total Parts:"
+          cat total_parts.txt
+
+          echo ""
           echo "Facebook Video ID:"
           cat facebook_video_id.txt
 
           echo ""
-          echo "Status:"
-          echo "Published to Facebook"
+          echo "Caption and hashtags:"
+          cat post_caption.txt
 
           echo ""
           echo "OneDrive:"
-          echo "Moved from Pending_Posts to Posted"
+          echo "Pending_Posts -> Posted"
+
+          echo ""
+          echo "Next scheduled run will process the next part."
 
           echo "========================================"
