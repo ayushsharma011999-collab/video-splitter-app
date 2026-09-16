@@ -2,9 +2,9 @@ import streamlit as st
 import requests
 import os
 import json
-import re
 import subprocess
 import tempfile
+import shutil
 from pathlib import Path
 
 
@@ -58,20 +58,13 @@ st.markdown(
     .main-title {
         font-size: 42px;
         font-weight: 800;
-        margin-bottom: 0px;
+        margin-bottom: 0;
     }
 
     .sub-title {
         font-size: 18px;
         opacity: 0.75;
         margin-bottom: 25px;
-    }
-
-    .status-box {
-        padding: 15px;
-        border-radius: 10px;
-        margin-top: 10px;
-        margin-bottom: 10px;
     }
 
     </style>
@@ -96,7 +89,7 @@ st.markdown(
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# SECRET HELPER
 # ============================================================
 
 def get_secret(name, default=""):
@@ -154,7 +147,9 @@ def get_application_access_token():
     access_token = token_data.get("access_token")
 
     if not access_token:
-        raise Exception("Microsoft Graph access token not received.")
+        raise Exception(
+            "Microsoft Graph access token not received."
+        )
 
     return access_token
 
@@ -171,7 +166,7 @@ def graph_headers(token):
 
 
 # ============================================================
-# GET ONEDRIVE
+# CHECK ONEDRIVE
 # ============================================================
 
 def get_user_drive(token):
@@ -188,7 +183,6 @@ def get_user_drive(token):
     )
 
     if response.status_code != 200:
-
         raise Exception(
             f"Unable to access OneDrive: "
             f"{response.status_code} - {response.text}"
@@ -198,7 +192,7 @@ def get_user_drive(token):
 
 
 # ============================================================
-# FIND ONEDRIVE FOLDER
+# GET FOLDER
 # ============================================================
 
 def get_folder(token, folder_name):
@@ -227,7 +221,7 @@ def get_folder(token, folder_name):
 
 
 # ============================================================
-# CREATE ONEDRIVE FOLDER
+# CREATE FOLDER
 # ============================================================
 
 def create_folder(token, folder_name):
@@ -254,7 +248,6 @@ def create_folder(token, folder_name):
     )
 
     if response.status_code not in [200, 201]:
-
         raise Exception(
             f"Folder creation failed: "
             f"{response.status_code} - {response.text}"
@@ -284,7 +277,7 @@ def get_or_create_folder(token, folder_name):
 
 
 # ============================================================
-# UPLOAD SMALL FILE
+# SMALL FILE UPLOAD
 # ============================================================
 
 def upload_small_file(
@@ -320,7 +313,7 @@ def upload_small_file(
 
 
 # ============================================================
-# UPLOAD LARGE FILE
+# LARGE FILE UPLOAD
 # ============================================================
 
 def upload_large_file(
@@ -366,7 +359,9 @@ def upload_large_file(
     )
 
     if not upload_url:
-        raise Exception("Upload URL was not returned.")
+        raise Exception(
+            "Upload URL was not returned."
+        )
 
     file_size = os.path.getsize(file_path)
 
@@ -418,7 +413,7 @@ def upload_large_file(
 
 
 # ============================================================
-# UPLOAD FILE TO ONEDRIVE
+# UPLOAD FILE
 # ============================================================
 
 def upload_file_to_onedrive(
@@ -448,7 +443,7 @@ def upload_file_to_onedrive(
 
 
 # ============================================================
-# GET VIDEO DURATION
+# VIDEO DURATION
 # ============================================================
 
 def get_video_duration(file_path):
@@ -471,18 +466,22 @@ def get_video_duration(file_path):
     )
 
     if result.returncode != 0:
+
         raise Exception(
             f"Unable to read video duration: "
             f"{result.stderr}"
         )
 
     try:
+
         return float(
             result.stdout.strip()
         )
+
     except Exception:
+
         raise Exception(
-            "Invalid video duration returned by ffprobe."
+            "Invalid video duration."
         )
 
 
@@ -516,54 +515,16 @@ def split_video(
         input_path
     ).stem
 
-    # --------------------------------------------------------
-    # ORIGINAL
-    # --------------------------------------------------------
-
-    if aspect_ratio == "Original":
-
-        segment_filter = None
-
-    # --------------------------------------------------------
-    # 9:16
-    # --------------------------------------------------------
-
-    elif aspect_ratio == "9:16":
-
-        segment_filter = (
-            "crop=ih*9/16:ih"
-        )
-
-    # --------------------------------------------------------
-    # 16:9
-    # --------------------------------------------------------
-
-    elif aspect_ratio == "16:9":
-
-        segment_filter = (
-            "crop=iw:iw*9/16"
-        )
-
-    # --------------------------------------------------------
-    # 1:1
-    # --------------------------------------------------------
-
-    elif aspect_ratio == "1:1":
-
-        segment_filter = (
-            "crop=min(iw\\,ih):min(iw\\,ih)"
-        )
-
-    else:
-
-        segment_filter = None
+    output_files = []
 
     total_clips = int(
         (duration + clip_duration - 1)
         // clip_duration
     )
 
-    output_files = []
+    # --------------------------------------------------------
+    # SPLIT EACH CLIP
+    # --------------------------------------------------------
 
     for index in range(total_clips):
 
@@ -586,14 +547,52 @@ def split_video(
             "-i",
             input_path,
             "-t",
-            str(clip_duration),
+            str(clip_duration)
         ]
 
-        if segment_filter:
+        # ----------------------------------------------------
+        # ASPECT RATIO
+        # ----------------------------------------------------
+
+        if aspect_ratio == "9:16":
 
             command.extend([
                 "-vf",
-                segment_filter,
+                "crop=ih*9/16:ih",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart"
+            ])
+
+        elif aspect_ratio == "16:9":
+
+            command.extend([
+                "-vf",
+                "crop=iw:iw*9/16",
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart"
+            ])
+
+        elif aspect_ratio == "1:1":
+
+            command.extend([
+                "-vf",
+                "crop=min(iw\\,ih):min(iw\\,ih)",
                 "-c:v",
                 "libx264",
                 "-preset",
@@ -727,7 +726,7 @@ def create_metadata(
 
 
 # ============================================================
-# GITHUB ACTIONS DISPATCH
+# GITHUB AUTO POSTER
 # ============================================================
 
 def run_github_auto_poster(
@@ -797,7 +796,7 @@ with st.sidebar:
 
     st.header("⚙️ Settings")
 
-    st.subheader("📄 Facebook Destination")
+    st.subheader("📘 Facebook Settings")
 
     posting_destination = st.radio(
         "Select Facebook Page",
@@ -826,7 +825,7 @@ with st.sidebar:
 
     # ========================================================
     # CLIP DURATION
-    # MAXIMUM = 20 MINUTES = 1200 SECONDS
+    # 1200 SECONDS = 20 MINUTES
     # ========================================================
 
     clip_duration = st.number_input(
@@ -835,12 +834,14 @@ with st.sidebar:
         max_value=1200,
         value=30,
         step=5,
-        help="Maximum clip duration is 1200 seconds (20 minutes)."
+        help="Maximum duration is 1200 seconds (20 minutes)."
     )
 
+    minutes = int(clip_duration // 60)
+    seconds = int(clip_duration % 60)
+
     st.caption(
-        f"⏱️ Selected: {clip_duration} seconds "
-        f"({clip_duration / 60:.1f} minutes)"
+        f"⏱️ Selected: {minutes} min {seconds} sec"
     )
 
     aspect_ratio = st.selectbox(
@@ -861,23 +862,17 @@ with st.sidebar:
 
     st.divider()
 
-    st.subheader("📘 Facebook")
+    st.subheader("📂 Selected Destination")
 
-    st.caption(
-        f"Destination: {posting_destination}"
-    )
-
-    st.caption(
-        f"OneDrive Folder: {selected_pending_folder}"
-    )
-
-    st.caption(
-        f"Workflow: {selected_github_workflow}"
+    st.info(
+        f"**Facebook:** {posting_destination}\n\n"
+        f"**OneDrive:** {selected_pending_folder}\n\n"
+        f"**Workflow:** {selected_github_workflow}"
     )
 
 
 # ============================================================
-# MAIN UPLOAD
+# UPLOAD VIDEO
 # ============================================================
 
 st.header("📤 Upload Video")
@@ -895,7 +890,7 @@ uploaded_file = st.file_uploader(
 
 
 # ============================================================
-# CONNECT ONEDRIVE
+# ONEDRIVE CONNECTION
 # ============================================================
 
 st.divider()
@@ -1011,13 +1006,13 @@ if uploaded_file:
             st.session_state.graph_token
         )
 
-        temp_input = None
+        temp_dir = None
 
         try:
 
-            # ==================================================
-            # CREATE TEMP DIRECTORY
-            # ==================================================
+            # ------------------------------------------------
+            # TEMP DIRECTORY
+            # ------------------------------------------------
 
             temp_dir = tempfile.mkdtemp(
                 prefix="pro_video_studio_"
@@ -1038,9 +1033,9 @@ if uploaded_file:
                 exist_ok=True
             )
 
-            # ==================================================
-            # SAVE UPLOADED VIDEO
-            # ==================================================
+            # ------------------------------------------------
+            # SAVE VIDEO
+            # ------------------------------------------------
 
             with open(
                 input_path,
@@ -1051,11 +1046,9 @@ if uploaded_file:
                     uploaded_file.getbuffer()
                 )
 
-            temp_input = input_path
-
-            # ==================================================
-            # GET DURATION
-            # ==================================================
+            # ------------------------------------------------
+            # VIDEO DURATION
+            # ------------------------------------------------
 
             with st.spinner(
                 "Reading video information..."
@@ -1067,14 +1060,18 @@ if uploaded_file:
                     )
                 )
 
-            st.info(
-                f"Original video duration: "
-                f"{original_duration / 60:.2f} minutes"
+            original_minutes = (
+                original_duration / 60
             )
 
-            # ==================================================
+            st.info(
+                f"Original video duration: "
+                f"{original_minutes:.2f} minutes"
+            )
+
+            # ------------------------------------------------
             # SPLIT
-            # ==================================================
+            # ------------------------------------------------
 
             with st.spinner(
                 f"Splitting video into "
@@ -1094,9 +1091,9 @@ if uploaded_file:
                 f"{total_clips} clip(s) created."
             )
 
-            # ==================================================
+            # ------------------------------------------------
             # SHOW CLIPS
-            # ==================================================
+            # ------------------------------------------------
 
             st.subheader(
                 "📦 Generated Clips"
@@ -1114,9 +1111,9 @@ if uploaded_file:
                     f"— {clip_size:.2f} MB"
                 )
 
-            # ==================================================
-            # GET/CREATE ONEDRIVE FOLDER
-            # ==================================================
+            # ------------------------------------------------
+            # GET/CREATE PENDING FOLDER
+            # ------------------------------------------------
 
             with st.spinner(
                 f"Opening {selected_pending_folder}..."
@@ -1135,9 +1132,9 @@ if uploaded_file:
                     "OneDrive folder ID was not returned."
                 )
 
-            # ==================================================
-            # CREATE METADATA
-            # ==================================================
+            # ------------------------------------------------
+            # METADATA
+            # ------------------------------------------------
 
             metadata = create_metadata(
                 source_video=uploaded_file.name,
@@ -1149,10 +1146,7 @@ if uploaded_file:
 
             metadata_path = os.path.join(
                 temp_dir,
-                (
-                    f"{Path(uploaded_file.name).stem}"
-                    f"_metadata.json"
-                )
+                f"{Path(uploaded_file.name).stem}_metadata.json"
             )
 
             with open(
@@ -1168,17 +1162,17 @@ if uploaded_file:
                     ensure_ascii=False
                 )
 
-            # ==================================================
+            # ------------------------------------------------
             # UPLOAD CLIPS
-            # ==================================================
+            # ------------------------------------------------
 
             st.subheader(
                 "☁️ Uploading to OneDrive"
             )
 
-            progress = st.progress(
-                0
-            )
+            progress = st.progress(0)
+
+            total_uploads = len(clips)
 
             for index, clip in enumerate(
                 clips,
@@ -1201,16 +1195,16 @@ if uploaded_file:
                     )
 
                 progress.progress(
-                    index / len(clips)
+                    index / total_uploads
                 )
 
                 st.write(
                     f"✅ Uploaded: {clip_name}"
                 )
 
-            # ==================================================
+            # ------------------------------------------------
             # UPLOAD METADATA
-            # ==================================================
+            # ------------------------------------------------
 
             with st.spinner(
                 "Uploading metadata..."
@@ -1229,35 +1223,15 @@ if uploaded_file:
                 "✅ Metadata uploaded successfully."
             )
 
-            # ==================================================
-            # FINAL UPLOAD MESSAGE
-            # ==================================================
-
             st.success(
                 f"🎉 All clips uploaded to "
                 f"`{selected_pending_folder}`"
             )
 
             st.info(
-                "The clips are now waiting for the "
-                "Facebook Auto Poster workflow."
+                "Videos are now available for the "
+                "Facebook Auto Poster."
             )
-
-            # ==================================================
-            # CLEAN TEMP FILES
-            # ==================================================
-
-            try:
-
-                import shutil
-
-                shutil.rmtree(
-                    temp_dir,
-                    ignore_errors=True
-                )
-
-            except Exception:
-                pass
 
         except Exception as e:
 
@@ -1267,26 +1241,33 @@ if uploaded_file:
 
             st.exception(e)
 
+        finally:
+
+            if temp_dir:
+
+                shutil.rmtree(
+                    temp_dir,
+                    ignore_errors=True
+                )
+
 
 # ============================================================
-# FACEBOOK AUTO POSTER
+# FACEBOOK AUTO POSTER BUTTON
 # ============================================================
 
 st.divider()
 
 st.header("📢 Facebook Auto Poster")
 
-st.write(
-    f"Selected destination: **{posting_destination}**"
+st.info(
+    f"Selected Page: **{posting_destination}**\n\n"
+    f"OneDrive Folder: **{selected_pending_folder}**\n\n"
+    f"GitHub Workflow: **{selected_github_workflow}**"
 )
 
-st.write(
-    f"Workflow: `{selected_github_workflow}`"
-)
-
-st.write(
-    f"OneDrive folder: `{selected_pending_folder}`"
-)
+# ============================================================
+# THIS IS THE FACEBOOK POST BUTTON
+# ============================================================
 
 run_poster = st.button(
     "▶️ Run Facebook Auto Poster",
@@ -1299,7 +1280,7 @@ if run_poster:
     try:
 
         with st.spinner(
-            "Starting Facebook Auto Poster..."
+            f"Starting {posting_destination} Facebook Auto Poster..."
         ):
 
             run_github_auto_poster(
@@ -1307,17 +1288,22 @@ if run_poster:
             )
 
         st.success(
-            "🚀 Facebook Auto Poster workflow started successfully!"
+            "🚀 Facebook Auto Poster started successfully!"
+        )
+
+        st.success(
+            f"📘 Destination: {posting_destination}"
         )
 
         st.info(
-            f"Destination: {posting_destination}"
+            "GitHub Actions will now pick the next "
+            "pending video and post it to Facebook."
         )
 
     except Exception as e:
 
         st.error(
-            f"❌ Unable to start Facebook Auto Poster: {e}"
+            f"❌ Facebook Auto Poster could not be started: {e}"
         )
 
 
