@@ -167,7 +167,8 @@ jobs:
 
 
       # ============================================================
-      # 8. CREATE FACEBOOK CAPTION WITH CLIP NUMBER
+      # 8. CREATE FACEBOOK CAPTION
+      #    CLIP NUMBER + TOP 5 HASHTAGS
       # ============================================================
       - name: Create Facebook Caption
         if: env.NO_VIDEO != 'true'
@@ -179,7 +180,7 @@ jobs:
           import os
 
           # --------------------------------------------------------
-          # Read metadata
+          # READ METADATA
           # --------------------------------------------------------
           try:
               with open("metadata.json", "r", encoding="utf-8") as f:
@@ -188,23 +189,28 @@ jobs:
               data = {}
 
           # --------------------------------------------------------
-          # Get total clips
+          # TOTAL CLIPS
           # --------------------------------------------------------
           total_clips = data.get("total_clips", 0)
 
           try:
               total_clips = int(total_clips)
-          except:
+          except Exception:
               total_clips = 0
 
           # --------------------------------------------------------
-          # Get current clip number from filename
-          # Example:
-          # movie_clip_001.mp4 -> 1
-          # movie_clip_002.mp4 -> 2
+          # CURRENT VIDEO NAME
           # --------------------------------------------------------
           video_name = os.environ.get("VIDEO_NAME", "")
 
+          # --------------------------------------------------------
+          # GET CLIP NUMBER
+          #
+          # Example:
+          # movie_clip_001.mp4 -> 1
+          # movie_clip_002.mp4 -> 2
+          # movie_clip_003.mp4 -> 3
+          # --------------------------------------------------------
           match = re.search(
               r"_clip_([0-9]+)\.mp4$",
               video_name,
@@ -217,48 +223,113 @@ jobs:
               clip_number = 1
 
           # --------------------------------------------------------
-          # If metadata total is unavailable, use current clip number
+          # FALLBACK TOTAL
           # --------------------------------------------------------
           if total_clips <= 0:
               total_clips = clip_number
 
           # --------------------------------------------------------
-          # Existing caption data
+          # TITLE
           # --------------------------------------------------------
-          title = str(data.get("title", "")).strip()
+          title = str(
+              data.get("title", "")
+          ).strip()
 
+          # --------------------------------------------------------
+          # DESCRIPTION
+          # --------------------------------------------------------
           description = str(
               data.get("description", "")
           ).strip()
 
+          # --------------------------------------------------------
+          # HASHTAGS
+          # --------------------------------------------------------
           hashtags = data.get("hashtags", "")
 
           if isinstance(hashtags, list):
-              hashtags = " ".join(str(x) for x in hashtags)
+              hashtag_list = hashtags
           else:
-              hashtags = str(hashtags).strip()
+              hashtag_list = str(hashtags).split()
 
-          existing_caption = " ".join(
-              x for x in [
-                  title,
-                  description,
-                  hashtags
+          # --------------------------------------------------------
+          # CLEAN HASHTAGS
+          # --------------------------------------------------------
+          clean_hashtags = []
+
+          for tag in hashtag_list:
+
+              tag = str(tag).strip()
+
+              if not tag:
+                  continue
+
+              # Remove #
+              tag = tag.lstrip("#")
+
+              # Remove spaces
+              tag = tag.replace(" ", "")
+
+              if not tag:
+                  continue
+
+              # Add #
+              tag = "#" + tag
+
+              # Avoid duplicate hashtags
+              existing = [
+                  x.lower()
+                  for x in clean_hashtags
               ]
-              if x
-          )
 
-          if not existing_caption:
-              existing_caption = "New movie/web series video 🎬"
+              if tag.lower() not in existing:
+                  clean_hashtags.append(tag)
 
           # --------------------------------------------------------
-          # NEW FACEBOOK CAPTION
+          # MAXIMUM TOP 5 CONTENT HASHTAGS
           # --------------------------------------------------------
-          caption = (
-              f"🎬 Clip {clip_number}/{total_clips}\n\n"
-              f"{existing_caption}\n\n"
-              f"#Clip{clip_number}"
+          top_5_hashtags = clean_hashtags[:5]
+
+          # --------------------------------------------------------
+          # CLIP HASHTAG
+          # --------------------------------------------------------
+          clip_hashtag = f"#Clip{clip_number}"
+
+          # --------------------------------------------------------
+          # FINAL HASHTAGS
+          # --------------------------------------------------------
+          final_hashtags = [
+              clip_hashtag
+          ] + top_5_hashtags
+
+          hashtag_text = " ".join(final_hashtags)
+
+          # --------------------------------------------------------
+          # BUILD CAPTION
+          # --------------------------------------------------------
+          caption_parts = []
+
+          # Clip number
+          caption_parts.append(
+              f"🎬 Clip {clip_number}/{total_clips}"
           )
 
+          # Title
+          if title:
+              caption_parts.append(title)
+
+          # Description
+          if description:
+              caption_parts.append(description)
+
+          # Hashtags
+          caption_parts.append(hashtag_text)
+
+          caption = "\n\n".join(caption_parts)
+
+          # --------------------------------------------------------
+          # SAVE CAPTION
+          # --------------------------------------------------------
           with open(
               "caption.txt",
               "w",
@@ -266,12 +337,15 @@ jobs:
           ) as f:
               f.write(caption)
 
+          # --------------------------------------------------------
+          # SHOW RESULT IN GITHUB LOG
+          # --------------------------------------------------------
           print("=========================================")
-          print("Facebook Caption Created")
+          print("FACEBOOK CAPTION CREATED")
           print("=========================================")
-          print(f"Video: {video_name}")
-          print(f"Clip Number: {clip_number}")
-          print(f"Total Clips: {total_clips}")
+          print(f"Video       : {video_name}")
+          print(f"Clip        : {clip_number}/{total_clips}")
+          print(f"Hashtags    : {hashtag_text}")
           print("-----------------------------------------")
           print(caption)
           print("=========================================")
@@ -305,6 +379,11 @@ jobs:
           set -e
 
           CAPTION=$(cat caption.txt)
+
+          echo "Posting video to Facebook..."
+          echo "Caption:"
+          cat caption.txt
+          echo "-----------------------------------------"
 
           RESPONSE=$(curl -s -X POST \
             "https://graph.facebook.com/v23.0/${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}/videos" \
