@@ -1,9 +1,7 @@
-```yaml
 name: Facebook Auto Poster - Movies and Web Series
 
 on:
   workflow_dispatch:
-
   schedule:
     - cron: "3-59/5 * * * *"
 
@@ -17,6 +15,9 @@ jobs:
 
     steps:
 
+      # --------------------------------------------------
+      # STEP 1: Get Microsoft Graph Token
+      # --------------------------------------------------
       - name: Get Microsoft Graph token
         env:
           TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -27,83 +28,70 @@ jobs:
 
           echo "Getting Microsoft Graph token..."
 
-          curl -sS -X POST \
+          TOKEN_RESPONSE=$(curl -sS -X POST \
             "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
             -H "Content-Type: application/x-www-form-urlencoded" \
             --data-urlencode "client_id=${CLIENT_ID}" \
             --data-urlencode "client_secret=${CLIENT_SECRET}" \
             --data-urlencode "scope=https://graph.microsoft.com/.default" \
-            --data-urlencode "grant_type=client_credentials" \
-            -o graph_token_response.json
+            --data-urlencode "grant_type=client_credentials")
 
-          python - <<'PY'
-          import json
+          echo "$TOKEN_RESPONSE" > token_response.json
 
-          with open("graph_token_response.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
+          GRAPH_TOKEN=$(python -c "import json; print(json.load(open('token_response.json'))['access_token'])")
 
-          token = data.get("access_token")
+          if [ -z "$GRAPH_TOKEN" ]; then
+            echo "ERROR: Microsoft Graph token was not generated."
+            exit 1
+          fi
 
-          if not token:
-              print("ERROR: Microsoft Graph token was not returned.")
-              print(data)
-              raise SystemExit(1)
+          echo "GRAPH_TOKEN=$GRAPH_TOKEN" >> "$GITHUB_ENV"
 
-          with open("graph_token.txt", "w", encoding="utf-8") as f:
-              f.write(token)
-
-          print("Graph token obtained successfully.")
-          PY
-
-          echo "GRAPH_TOKEN=$(cat graph_token.txt)" >> "$GITHUB_ENV"
+          echo "Microsoft Graph token generated successfully."
 
 
-      - name: List Pending_Posts
+      # --------------------------------------------------
+      # STEP 2: List Movies Pending Posts
+      # --------------------------------------------------
+      - name: List Movies_Pending_Posts
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
           set -e
 
-          echo "Checking Pending_Posts..."
+          echo "Checking Movies_Pending_Posts..."
 
           curl -sS \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-              "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Pending_Posts:/children"            -o pending_list.json \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Pending_Posts:/children" \
+            -o pending_list.json \
             -w "%{http_code}" \
             > pending_http_code.txt
 
           HTTP_CODE=$(cat pending_http_code.txt)
 
-          echo "HTTP Status: ${HTTP_CODE}"
+          echo "Microsoft Graph HTTP Status: ${HTTP_CODE}"
 
-          if [ "${HTTP_CODE}" != "200" ]; then
-            echo "ERROR: Could not read Pending_Posts."
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR: Could not access Movies_Pending_Posts."
             cat pending_list.json
             exit 1
           fi
 
-          python - <<'PY'
-          import json
-
-          with open("pending_list.json", "r", encoding="utf-8") as f:
-              data = json.load(f)
-
-          items = data.get("value", [])
-
-          print("Items found:", len(items))
-
-          for item in items:
-              print(item.get("name", ""))
-          PY
+          echo "Movies_Pending_Posts accessed successfully."
 
 
-      - name: Select next video and matching metadata
+      # --------------------------------------------------
+      # STEP 3: Find Next Video
+      # --------------------------------------------------
+      - name: Find next movie video
         run: |
           set -e
 
-          python - <<'PY'
+          python <<'PY'
           import json
           import re
+          import os
 
           with open("pending_list.json", "r", encoding="utf-8") as f:
               data = json.load(f)
@@ -121,548 +109,365 @@ jobs:
               match = re.search(r"_clip_(\d+)\.mp4$", name, re.IGNORECASE)
 
               if match:
-                  part_number = int(match.group(1))
-              else:
-                  part_number = 999999
-
-              videos.append({
-                  "item": item,
-                  "part_number": part_number
-              })
+                  clip_number = int(match.group(1))
+                  videos.append((clip_number, name, item))
 
           if not videos:
-              print("No pending MP4 videos found.")
-              print("Nothing to post.")
+              print("No movie video found in Movies_Pending_Posts.")
+              open("NO_VIDEO", "w").close()
               raise SystemExit(0)
 
-          videos.sort(
-              key=lambda x: (
-                  x["item"].get("name", "").rsplit("_clip_", 1)[0],
-                  x["part_number"],
-                  x["item"].get("name", "")
-              )
-          )
+          videos.sort(key=lambda x: x[0])
 
-          selected = videos[0]["item"]
+          clip_number, video_name, video_item = videos[0]
 
-          video_name = selected["name"]
-          video_id = selected["id"]
-          video_url = selected.get("@microsoft.graph.downloadUrl")
+          print(f"Selected video: {video_name}")
+          print(f"Clip number: {clip_number}")
 
-          if not video_url:
-              print("ERROR: Video download URL not available.")
-              raise SystemExit(1)
+          with open("selected_video.json", "w", encoding="utf-8") as f:
+              json.dump(video_item, f, indent=2)
 
-          print("Selected video:")
-          print(video_name)
-
-          print("Item ID:")
-          print(video_id)
-
-          # Find source base name.
-          clip_match = re.match(
-              r"^(.*)_clip_(\d+)\.mp4$",
-              video_name,
-              re.IGNORECASE
-          )
-
-          if clip_match:
-              source_base = clip_match.group(1)
-              current_part = int(clip_match.group(2))
-          else:
-              source_base = video_name.rsplit(".", 1)[0]
-              current_part = 1
-
-          metadata_name = source_base + "_metadata.json"
-
-          print("Matching metadata:")
-          print(metadata_name)
-
-          metadata = None
-
-          for item in items:
-              if item.get("name", "").lower() == metadata_name.lower():
-                  metadata = item
-                  break
-
-          if metadata is None:
-              print("ERROR: Matching metadata file was not found.")
-              print("Expected:", metadata_name)
-              raise SystemExit(1)
-
-          total_parts = 0
-
-          for item in items:
-              item_name = item.get("name", "")
-
-              if (
-                  item_name.lower().startswith(source_base.lower() + "_clip_")
-                  and item_name.lower().endswith(".mp4")
-              ):
-                  total_parts += 1
-
-          print("Current part:", current_part)
-          print("Total pending parts:", total_parts)
-
-          with open("selected_video.txt", "w", encoding="utf-8") as f:
+          with open("SELECTED_VIDEO_NAME", "w", encoding="utf-8") as f:
               f.write(video_name)
 
-          with open("selected_item_id.txt", "w", encoding="utf-8") as f:
-              f.write(video_id)
-
-          with open("selected_download_url.txt", "w", encoding="utf-8") as f:
-              f.write(video_url)
-
-          with open("selected_metadata_name.txt", "w", encoding="utf-8") as f:
-              f.write(metadata_name)
-
-          with open("selected_metadata_id.txt", "w", encoding="utf-8") as f:
-              f.write(metadata["id"])
-
-          with open("current_part.txt", "w", encoding="utf-8") as f:
-              f.write(str(current_part))
-
-          with open("total_parts.txt", "w", encoding="utf-8") as f:
-              f.write(str(total_parts))
-
-          with open(
-              "metadata_download_url.txt",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(metadata["@microsoft.graph.downloadUrl"])
+          with open("SELECTED_CLIP_NUMBER", "w", encoding="utf-8") as f:
+              f.write(str(clip_number))
           PY
 
+          if [ -f "NO_VIDEO" ]; then
+            echo "Nothing to post."
+            exit 0
+          fi
 
-      - name: Download matching metadata
+
+      # --------------------------------------------------
+      # STEP 4: Find Matching Metadata
+      # --------------------------------------------------
+      - name: Find matching metadata
+        env:
+          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
           set -e
 
-          METADATA_URL=$(cat metadata_download_url.txt)
+          VIDEO_NAME=$(cat SELECTED_VIDEO_NAME)
 
-          echo "Downloading matching metadata..."
+          BASE_NAME="${VIDEO_NAME%_clip_*.mp4}"
 
-          curl -L --fail \
-            "${METADATA_URL}" \
+          METADATA_NAME="${BASE_NAME}_metadata.json"
+
+          echo "Video: ${VIDEO_NAME}"
+          echo "Metadata: ${METADATA_NAME}"
+
+          curl -sS \
+            -H "Authorization: Bearer ${GRAPH_TOKEN}" \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Pending_Posts:/children" \
+            -o metadata_list.json
+
+          python <<'PY'
+          import json
+          import os
+          import sys
+
+          video_name = open("SELECTED_VIDEO_NAME", encoding="utf-8").read().strip()
+
+          base_name = video_name.rsplit("_clip_", 1)[0]
+
+          expected = base_name + "_metadata.json"
+
+          with open("metadata_list.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          found = None
+
+          for item in data.get("value", []):
+              if item.get("name") == expected:
+                  found = item
+                  break
+
+          if not found:
+              print(f"ERROR: Metadata file not found: {expected}")
+              sys.exit(1)
+
+          with open("selected_metadata.json", "w", encoding="utf-8") as f:
+              json.dump(found, f, indent=2)
+
+          print(f"Metadata found: {expected}")
+          PY
+
+
+      # --------------------------------------------------
+      # STEP 5: Download Metadata
+      # --------------------------------------------------
+      - name: Download metadata
+        env:
+          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+        run: |
+          set -e
+
+          METADATA_ID=$(python -c "import json; print(json.load(open('selected_metadata.json'))['id'])")
+
+          echo "Downloading metadata..."
+
+          curl -sS \
+            -H "Authorization: Bearer ${GRAPH_TOKEN}" \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${METADATA_ID}/content" \
             -o metadata.json
 
           echo "Metadata downloaded."
 
-          cat metadata.json
 
-
-      - name: Build caption and hashtags
+      # --------------------------------------------------
+      # STEP 6: Create Caption
+      # --------------------------------------------------
+      - name: Create Facebook caption
         run: |
           set -e
 
-          python - <<'PY'
+          python <<'PY'
           import json
 
-          with open("metadata.json", "r", encoding="utf-8") as f:
+          with open("metadata.json", encoding="utf-8") as f:
               data = json.load(f)
 
-          caption = data.get("caption", "")
-
-          if not caption:
-              caption = data.get("description", "")
-
-          if not caption:
-              caption = "New video"
-
-          # Read hashtags from metadata if available.
+          title = data.get("title", "")
+          description = data.get("description", "")
           hashtags = data.get("hashtags", "")
-
-          if not hashtags:
-              hashtags = data.get("tags", "")
 
           if isinstance(hashtags, list):
               hashtags = " ".join(str(x) for x in hashtags)
 
-          hashtags = str(hashtags).strip()
+          caption_parts = []
 
-          # If metadata has no hashtags, use default hashtags.
-          if not hashtags:
-              hashtags = "#viral #trending #shorts #reels"
+          if title:
+              caption_parts.append(str(title))
 
-          # Make sure each tag starts with #.
-          tag_list = []
+          if description:
+              caption_parts.append(str(description))
 
-          for tag in hashtags.replace(",", " ").split():
-              tag = tag.strip()
+          if hashtags:
+              caption_parts.append(str(hashtags))
 
-              if not tag:
-                  continue
+          caption = "\n\n".join(caption_parts).strip()
 
-              if not tag.startswith("#"):
-                  tag = "#" + tag
+          if not caption:
+              caption = "New movie/web series video 🎬"
 
-              tag_list.append(tag)
+          with open("caption.txt", "w", encoding="utf-8") as f:
+              f.write(caption)
 
-          hashtags = " ".join(tag_list)
-
-          current_part = int(
-              open(
-                  "current_part.txt",
-                  "r",
-                  encoding="utf-8"
-              ).read().strip()
-          )
-
-          total_parts = int(
-              open(
-                  "total_parts.txt",
-                  "r",
-                  encoding="utf-8"
-              ).read().strip()
-          )
-
-          part_text = f"Part {current_part}/{total_parts}"
-
-          final_caption = (
-              caption.strip()
-              + "\n\n"
-              + part_text
-              + "\n\n"
-              + hashtags
-          )
-
-          print("Final Facebook caption:")
-          print("--------------------------------")
-          print(final_caption)
-          print("--------------------------------")
-
-          with open("post_caption.txt", "w", encoding="utf-8") as f:
-              f.write(final_caption)
+          print("Caption created:")
+          print(caption)
           PY
 
 
-      - name: Download selected video
-        run: |
-          set -e
-
-          VIDEO=$(cat selected_video.txt)
-          VIDEO_URL=$(cat selected_download_url.txt)
-
-          mkdir -p pending_files
-
-          echo "Downloading selected video:"
-          echo "${VIDEO}"
-
-          curl -L --fail \
-            "${VIDEO_URL}" \
-            -o "pending_files/${VIDEO}"
-
-          echo "Video downloaded."
-
-          ls -lh "pending_files/${VIDEO}"
-
-
-      - name: Check Movies Facebook secrets
+      # --------------------------------------------------
+      # STEP 7: Download Video
+      # --------------------------------------------------
+      - name: Download movie video
         env:
-          MOVIES_FACEBOOK_PAGE_ID: ${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}
-          MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN }}
+          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
           set -e
 
-          if [ -z "${MOVIES_FACEBOOK_PAGE_ID}" ]; then
+          VIDEO_ID=$(python -c "import json; print(json.load(open('selected_video.json'))['id'])")
+
+          echo "Downloading selected movie video..."
+
+          curl -L -sS \
+            -H "Authorization: Bearer ${GRAPH_TOKEN}" \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${VIDEO_ID}/content" \
+            -o movie_video.mp4
+
+          if [ ! -s movie_video.mp4 ]; then
+            echo "ERROR: Video download failed."
+            exit 1
+          fi
+
+          echo "Video downloaded successfully."
+
+          ls -lh movie_video.mp4
+
+
+      # --------------------------------------------------
+      # STEP 8: Validate Facebook Secrets
+      # --------------------------------------------------
+      - name: Validate Facebook configuration
+        env:
+          FACEBOOK_PAGE_ID: ${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN }}
+        run: |
+          set -e
+
+          if [ -z "$FACEBOOK_PAGE_ID" ]; then
             echo "ERROR: MOVIES_FACEBOOK_PAGE_ID secret is missing."
             exit 1
           fi
 
-          if [ -z "${MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN}" ]; then
+          if [ -z "$FACEBOOK_PAGE_ACCESS_TOKEN" ]; then
             echo "ERROR: MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN secret is missing."
             exit 1
           fi
 
-          echo "Movies Facebook secrets are available."
-
-          echo "Target Page ID:"
-          echo "${MOVIES_FACEBOOK_PAGE_ID}"
+          echo "Facebook Page configuration is available."
 
 
-      - name: Publish next part to Movies and Web Series
+      # --------------------------------------------------
+      # STEP 9: Upload Video to Facebook
+      # --------------------------------------------------
+      - name: Upload video to Movies and web series
         env:
-          MOVIES_FACEBOOK_PAGE_ID: ${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}
-          MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN }}
+          FACEBOOK_PAGE_ID: ${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}
+          FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN }}
         run: |
           set -e
 
-          VIDEO=$(cat selected_video.txt)
-          CAPTION=$(cat post_caption.txt)
+          echo "Uploading video to Facebook..."
 
-          echo "========================================"
-          echo "Publishing next Facebook part"
-          echo "Page: Movies and Web Series"
-          echo "========================================"
+          RESPONSE=$(curl -sS -X POST \
+            "https://graph.facebook.com/v23.0/${FACEBOOK_PAGE_ID}/videos" \
+            -H "Authorization: Bearer ${FACEBOOK_PAGE_ACCESS_TOKEN}" \
+            -F "source=@movie_video.mp4" \
+            -F "description=<caption.txt")
 
-          echo "Video:"
-          echo "${VIDEO}"
+          echo "$RESPONSE" > facebook_response.json
 
-          echo ""
-          echo "Caption:"
-          cat post_caption.txt
-
-          curl -sS \
-            -X POST \
-            "https://graph.facebook.com/v23.0/${MOVIES_FACEBOOK_PAGE_ID}/videos" \
-            -H "Authorization: Bearer ${MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN}" \
-            -F "source=@pending_files/${VIDEO}" \
-            --form-string "description=${CAPTION}" \
-            -o facebook_response.json \
-            -w "%{http_code}" \
-            > facebook_http_code.txt
-
-          MOVIES_FACEBOOK_HTTP_CODE=$(cat facebook_http_code.txt)
-
-          echo ""
-          echo "Facebook HTTP Status: ${MOVIES_FACEBOOK_HTTP_CODE}"
-
-          echo ""
           echo "Facebook response:"
           cat facebook_response.json
 
-          if [ "${MOVIES_FACEBOOK_HTTP_CODE}" -lt 200 ] || \
-             [ "${MOVIES_FACEBOOK_HTTP_CODE}" -ge 300 ]; then
+          VIDEO_ID=$(python - <<'PY'
+          import json
 
-            echo ""
-            echo "ERROR: Facebook upload failed."
-            echo "The video will remain in Pending_Posts."
+          with open("facebook_response.json", encoding="utf-8") as f:
+              data = json.load(f)
+
+          if "error" in data:
+              print("FACEBOOK_ERROR")
+          else:
+              print(data.get("id", ""))
+          PY
+          )
+
+          if [ "$VIDEO_ID" = "FACEBOOK_ERROR" ]; then
+            echo "ERROR: Facebook rejected the video."
             exit 1
           fi
 
-          python - <<'PY'
-          import json
+          if [ -z "$VIDEO_ID" ]; then
+            echo "ERROR: Facebook did not return a video ID."
+            exit 1
+          fi
 
-          with open(
-              "facebook_response.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = json.load(f)
-
-          video_id = data.get("id")
-
-          if not video_id:
-              print(
-                  "ERROR: Facebook video ID was not returned."
-              )
-              print(data)
-              raise SystemExit(1)
-
-          print("Facebook Video ID:", video_id)
-
-          with open(
-              "facebook_video_id.txt",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(video_id)
-
-          print("Facebook upload successful.")
-          PY
+          echo "Facebook video posted successfully."
+          echo "Facebook Video ID: ${VIDEO_ID}"
 
 
-      - name: Find or create Posted folder
+      # --------------------------------------------------
+      # STEP 10: Find Movies_Posted Folder
+      # --------------------------------------------------
+      - name: Find Movies_Posted folder
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
           set -e
 
-          echo "Checking Posted folder..."
-
           curl -sS \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Posted" \
-            -o posted_folder.json \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Posted:/children" \
+            -o posted_folder_check.json
+
+          HTTP_CODE=$(curl -sS -o /dev/null \
             -w "%{http_code}" \
-            > posted_http_code.txt
+            -H "Authorization: Bearer ${GRAPH_TOKEN}" \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Posted:/children")
 
-          HTTP_CODE=$(cat posted_http_code.txt)
+          echo "Movies_Posted HTTP Status: ${HTTP_CODE}"
 
-          echo "Posted folder HTTP Status: ${HTTP_CODE}"
+          if [ "$HTTP_CODE" = "200" ]; then
+            echo "Movies_Posted folder exists."
+          else
+            echo "Movies_Posted folder does not exist."
+            echo "Creating Movies_Posted folder..."
 
-          if [ "${HTTP_CODE}" = "200" ]; then
-
-            python - <<'PY'
-          import json
-
-          with open(
-              "posted_folder.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = json.load(f)
-
-          folder_id = data.get("id")
-
-          if not folder_id:
-              print("ERROR: Posted folder ID not found.")
-              print(data)
-              raise SystemExit(1)
-
-          print("Posted folder found.")
-          print("Folder ID:", folder_id)
-
-          with open(
-              "posted_folder_id.txt",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(folder_id)
-          PY
-
-          elif [ "${HTTP_CODE}" = "404" ]; then
-
-            echo "Posted folder does not exist."
-            echo "Creating Posted folder..."
-
-            printf '%s' \
-              '{"name":"Movies_Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
-              > create_posted.json
-
-            curl -sS \
-              -X POST \
-              "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children" \
+            curl -sS -X POST \
               -H "Authorization: Bearer ${GRAPH_TOKEN}" \
               -H "Content-Type: application/json" \
-              --data-binary @create_posted.json \
-              -o posted_folder_created.json \
-              -w "%{http_code}" \
-              > posted_create_http_code.txt
+              "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root/children" \
+              -d '{
+                "name": "Movies_Posted",
+                "folder": {},
+                "@microsoft.graph.conflictBehavior": "fail"
+              }' \
+              -o create_posted_response.json
 
-            CREATE_HTTP_CODE=$(cat posted_create_http_code.txt)
-
-            echo "Create folder HTTP Status: ${CREATE_HTTP_CODE}"
-
-            if [ "${CREATE_HTTP_CODE}" -lt 200 ] || \
-               [ "${CREATE_HTTP_CODE}" -ge 300 ]; then
-
-              echo "ERROR: Could not create Posted folder."
-              cat posted_folder_created.json
-              exit 1
-            fi
-
-            python - <<'PY'
-          import json
-
-          with open(
-              "posted_folder_created.json",
-              "r",
-              encoding="utf-8"
-          ) as f:
-              data = json.load(f)
-
-          folder_id = data.get("id")
-
-          if not folder_id:
-              print(
-                  "ERROR: Created Posted folder ID not found."
-              )
-              print(data)
-              raise SystemExit(1)
-
-          print("Posted folder created.")
-          print("Folder ID:", folder_id)
-
-          with open(
-              "posted_folder_id.txt",
-              "w",
-              encoding="utf-8"
-          ) as f:
-              f.write(folder_id)
-          PY
-
-          else
-
-            echo "ERROR: Unexpected Posted folder response."
-            cat posted_folder.json
-            exit 1
-
+            cat create_posted_response.json
           fi
 
-          POSTED_FOLDER_ID=$(cat posted_folder_id.txt)
 
-          echo "POSTED_FOLDER_ID=${POSTED_FOLDER_ID}" >> "$GITHUB_ENV"
-
-          echo "Posted folder ready."
-
-
-      - name: Move successfully posted video to Posted
+      # --------------------------------------------------
+      # STEP 11: Move Video to Movies_Posted
+      # --------------------------------------------------
+      - name: Move posted video to Movies_Posted
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
-          POSTED_FOLDER_ID: ${{ env.POSTED_FOLDER_ID }}
         run: |
           set -e
 
-          ITEM_ID=$(cat selected_item_id.txt)
-          VIDEO=$(cat selected_video.txt)
+          VIDEO_ID=$(python -c "import json; print(json.load(open('selected_video.json'))['id'])")
 
-          echo "Moving successfully posted video:"
-          echo "${VIDEO}"
+          echo "Moving video to Movies_Posted..."
 
-          printf '%s' \
-            "{\"parentReference\":{\"id\":\"${POSTED_FOLDER_ID}\"}}" \
-            > move_body.json
-
-          curl -sS \
-            -X PATCH \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${ITEM_ID}" \
+          curl -sS -X PATCH \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
             -H "Content-Type: application/json" \
-            --data-binary @move_body.json \
-            -o move_response.json \
-            -w "%{http_code}" \
-            > move_http_code.txt
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${VIDEO_ID}" \
+            -d '{
+              "parentReference": {
+                "path": "/drive/root:/Movies_Posted"
+              }
+            }' \
+            -o move_video_response.json
 
-          MOVE_HTTP_CODE=$(cat move_http_code.txt)
-
-          echo "Move HTTP Status: ${MOVE_HTTP_CODE}"
-
-          if [ "${MOVE_HTTP_CODE}" != "200" ]; then
-            echo "ERROR: Facebook post succeeded but OneDrive move failed."
-            cat move_response.json
-            exit 1
-          fi
-
-          echo "Video successfully moved to Posted."
+          echo "Move response:"
+          cat move_video_response.json
 
 
+      # --------------------------------------------------
+      # STEP 12: Move Metadata to Movies_Posted
+      # --------------------------------------------------
+      - name: Move metadata to Movies_Posted
+        env:
+          GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
+        run: |
+          set -e
+
+          METADATA_ID=$(python -c "import json; print(json.load(open('selected_metadata.json'))['id'])")
+
+          echo "Moving metadata to Movies_Posted..."
+
+          curl -sS -X PATCH \
+            -H "Authorization: Bearer ${GRAPH_TOKEN}" \
+            -H "Content-Type: application/json" \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${METADATA_ID}" \
+            -d '{
+              "parentReference": {
+                "path": "/drive/root:/Movies_Posted"
+              }
+            }' \
+            -o move_metadata_response.json
+
+          echo "Metadata moved successfully."
+
+
+      # --------------------------------------------------
+      # STEP 13: Final Success
+      # --------------------------------------------------
       - name: Final result
         run: |
-          echo ""
-          echo "========================================"
-          echo "MOVIES FACEBOOK AUTO POST SUCCESS"
-          echo "========================================"
-
-          echo "Page:"
-          echo "Movies and Web Series"
-
-          echo ""
-          echo "Video:"
-          cat selected_video.txt
-
-          echo ""
-          echo "Part:"
-          cat current_part.txt
-
-          echo ""
-          echo "Total Parts:"
-          cat total_parts.txt
-
-          echo ""
-          echo "Facebook Video ID:"
-          cat facebook_video_id.txt
-
-          echo ""
-          echo "Caption and hashtags:"
-          cat post_caption.txt
-
-          echo ""
-          echo "OneDrive:"
-          echo "Movies_Pending_Posts -> Movies_Posted"
-
-          echo ""
-          echo "Next scheduled run will process the next part."
-
-          echo "========================================"
-```
+          echo "=========================================="
+          echo "MOVIES AUTO POST SUCCESSFUL"
+          echo "=========================================="
+          echo "Source folder : Movies_Pending_Posts"
+          echo "Target folder : Movies_Posted"
+          echo "Facebook Page  : Movies and web series"
+          echo "Page ID        : 622325740963525"
+          echo "=========================================="
