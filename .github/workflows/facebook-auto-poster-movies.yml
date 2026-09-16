@@ -15,9 +15,9 @@ jobs:
 
     steps:
 
-      # --------------------------------------------------
-      # STEP 1: Get Microsoft Graph Token
-      # --------------------------------------------------
+      # ==================================================
+      # 1. GET MICROSOFT GRAPH TOKEN
+      # ==================================================
       - name: Get Microsoft Graph token
         env:
           TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -50,9 +50,9 @@ jobs:
           echo "Microsoft Graph token generated successfully."
 
 
-      # --------------------------------------------------
-      # STEP 2: List Movies Pending Posts
-      # --------------------------------------------------
+      # ==================================================
+      # 2. LIST MOVIES PENDING FOLDER
+      # ==================================================
       - name: List Movies_Pending_Posts
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
@@ -81,17 +81,22 @@ jobs:
           echo "Movies_Pending_Posts accessed successfully."
 
 
-      # --------------------------------------------------
-      # STEP 3: Find Next Video
-      # --------------------------------------------------
+      # ==================================================
+      # 3. FIND NEXT MOVIE VIDEO
+      # ==================================================
       - name: Find next movie video
+        id: find_video
         run: |
           set -e
+
+          rm -f NO_VIDEO
+          rm -f SELECTED_VIDEO_NAME
+          rm -f SELECTED_CLIP_NUMBER
+          rm -f selected_video.json
 
           python <<'PY'
           import json
           import re
-          import os
 
           with open("pending_list.json", "r", encoding="utf-8") as f:
               data = json.load(f)
@@ -114,7 +119,10 @@ jobs:
 
           if not videos:
               print("No movie video found in Movies_Pending_Posts.")
-              open("NO_VIDEO", "w").close()
+
+              with open("NO_VIDEO", "w") as f:
+                  f.write("true")
+
               raise SystemExit(0)
 
           videos.sort(key=lambda x: x[0])
@@ -135,15 +143,31 @@ jobs:
           PY
 
           if [ -f "NO_VIDEO" ]; then
-            echo "Nothing to post."
-            exit 0
+            echo "No video available."
+            echo "Workflow will finish without posting."
           fi
 
 
-      # --------------------------------------------------
-      # STEP 4: Find Matching Metadata
-      # --------------------------------------------------
+      # ==================================================
+      # 4. CHECK WHETHER VIDEO EXISTS
+      # ==================================================
+      - name: Check video availability
+        id: video_check
+        run: |
+          if [ -f "NO_VIDEO" ]; then
+            echo "has_video=false" >> "$GITHUB_OUTPUT"
+            echo "No video found."
+          else
+            echo "has_video=true" >> "$GITHUB_OUTPUT"
+            echo "Video found."
+          fi
+
+
+      # ==================================================
+      # 5. FIND MATCHING METADATA
+      # ==================================================
       - name: Find matching metadata
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
@@ -165,10 +189,12 @@ jobs:
 
           python <<'PY'
           import json
-          import os
           import sys
 
-          video_name = open("SELECTED_VIDEO_NAME", encoding="utf-8").read().strip()
+          video_name = open(
+              "SELECTED_VIDEO_NAME",
+              encoding="utf-8"
+          ).read().strip()
 
           base_name = video_name.rsplit("_clip_", 1)[0]
 
@@ -195,10 +221,11 @@ jobs:
           PY
 
 
-      # --------------------------------------------------
-      # STEP 5: Download Metadata
-      # --------------------------------------------------
+      # ==================================================
+      # 6. DOWNLOAD METADATA
+      # ==================================================
       - name: Download metadata
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
@@ -213,13 +240,14 @@ jobs:
             "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/items/${METADATA_ID}/content" \
             -o metadata.json
 
-          echo "Metadata downloaded."
+          echo "Metadata downloaded successfully."
 
 
-      # --------------------------------------------------
-      # STEP 6: Create Caption
-      # --------------------------------------------------
+      # ==================================================
+      # 7. CREATE FACEBOOK CAPTION
+      # ==================================================
       - name: Create Facebook caption
+        if: steps.video_check.outputs.has_video == 'true'
         run: |
           set -e
 
@@ -236,18 +264,18 @@ jobs:
           if isinstance(hashtags, list):
               hashtags = " ".join(str(x) for x in hashtags)
 
-          caption_parts = []
+          parts = []
 
           if title:
-              caption_parts.append(str(title))
+              parts.append(str(title))
 
           if description:
-              caption_parts.append(str(description))
+              parts.append(str(description))
 
           if hashtags:
-              caption_parts.append(str(hashtags))
+              parts.append(str(hashtags))
 
-          caption = "\n\n".join(caption_parts).strip()
+          caption = "\n\n".join(parts).strip()
 
           if not caption:
               caption = "New movie/web series video 🎬"
@@ -260,10 +288,11 @@ jobs:
           PY
 
 
-      # --------------------------------------------------
-      # STEP 7: Download Video
-      # --------------------------------------------------
+      # ==================================================
+      # 8. DOWNLOAD VIDEO
+      # ==================================================
       - name: Download movie video
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
@@ -288,10 +317,11 @@ jobs:
           ls -lh movie_video.mp4
 
 
-      # --------------------------------------------------
-      # STEP 8: Validate Facebook Secrets
-      # --------------------------------------------------
+      # ==================================================
+      # 9. VALIDATE FACEBOOK SECRETS
+      # ==================================================
       - name: Validate Facebook configuration
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           FACEBOOK_PAGE_ID: ${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN }}
@@ -308,13 +338,14 @@ jobs:
             exit 1
           fi
 
-          echo "Facebook Page configuration is available."
+          echo "Facebook configuration is available."
 
 
-      # --------------------------------------------------
-      # STEP 9: Upload Video to Facebook
-      # --------------------------------------------------
+      # ==================================================
+      # 10. UPLOAD VIDEO TO FACEBOOK
+      # ==================================================
       - name: Upload video to Movies and web series
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           FACEBOOK_PAGE_ID: ${{ secrets.MOVIES_FACEBOOK_PAGE_ID }}
           FACEBOOK_PAGE_ACCESS_TOKEN: ${{ secrets.MOVIES_FACEBOOK_PAGE_ACCESS_TOKEN }}
@@ -334,7 +365,7 @@ jobs:
           echo "Facebook response:"
           cat facebook_response.json
 
-          VIDEO_ID=$(python - <<'PY'
+          VIDEO_ID=$(python <<'PY'
           import json
 
           with open("facebook_response.json", encoding="utf-8") as f:
@@ -361,21 +392,20 @@ jobs:
           echo "Facebook Video ID: ${VIDEO_ID}"
 
 
-      # --------------------------------------------------
-      # STEP 10: Find Movies_Posted Folder
-      # --------------------------------------------------
-      - name: Find Movies_Posted folder
+      # ==================================================
+      # 11. CHECK MOVIES_POSTED FOLDER
+      # ==================================================
+      - name: Check Movies_Posted folder
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
           set -e
 
-          curl -sS \
-            -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Posted:/children" \
-            -o posted_folder_check.json
+          echo "Checking Movies_Posted folder..."
 
-          HTTP_CODE=$(curl -sS -o /dev/null \
+          HTTP_CODE=$(curl -sS \
+            -o posted_folder.json \
             -w "%{http_code}" \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
             "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Posted:/children")
@@ -385,7 +415,7 @@ jobs:
           if [ "$HTTP_CODE" = "200" ]; then
             echo "Movies_Posted folder exists."
           else
-            echo "Movies_Posted folder does not exist."
+            echo "Movies_Posted folder not found."
             echo "Creating Movies_Posted folder..."
 
             curl -sS -X POST \
@@ -403,10 +433,11 @@ jobs:
           fi
 
 
-      # --------------------------------------------------
-      # STEP 11: Move Video to Movies_Posted
-      # --------------------------------------------------
+      # ==================================================
+      # 12. MOVE VIDEO TO MOVIES_POSTED
+      # ==================================================
       - name: Move posted video to Movies_Posted
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
@@ -427,14 +458,15 @@ jobs:
             }' \
             -o move_video_response.json
 
-          echo "Move response:"
+          echo "Video move response:"
           cat move_video_response.json
 
 
-      # --------------------------------------------------
-      # STEP 12: Move Metadata to Movies_Posted
-      # --------------------------------------------------
+      # ==================================================
+      # 13. MOVE METADATA TO MOVIES_POSTED
+      # ==================================================
       - name: Move metadata to Movies_Posted
+        if: steps.video_check.outputs.has_video == 'true'
         env:
           GRAPH_TOKEN: ${{ env.GRAPH_TOKEN }}
         run: |
@@ -458,16 +490,24 @@ jobs:
           echo "Metadata moved successfully."
 
 
-      # --------------------------------------------------
-      # STEP 13: Final Success
-      # --------------------------------------------------
+      # ==================================================
+      # 14. FINAL RESULT
+      # ==================================================
       - name: Final result
         run: |
           echo "=========================================="
-          echo "MOVIES AUTO POST SUCCESSFUL"
+          echo "MOVIES AUTO POSTER FINISHED"
           echo "=========================================="
-          echo "Source folder : Movies_Pending_Posts"
-          echo "Target folder : Movies_Posted"
-          echo "Facebook Page  : Movies and web series"
-          echo "Page ID        : 622325740963525"
+
+          if [ -f "NO_VIDEO" ]; then
+            echo "Status: No video available"
+            echo "Movies_Pending_Posts is currently empty."
+          else
+            echo "Status: Video processing completed"
+            echo "Source: Movies_Pending_Posts"
+            echo "Target: Movies_Posted"
+            echo "Facebook Page: Movies and web series"
+            echo "Page ID: 622325740963525"
+          fi
+
           echo "=========================================="
