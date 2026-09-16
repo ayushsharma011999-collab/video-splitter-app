@@ -1,11 +1,11 @@
+import streamlit as st
+import requests
 import os
 import json
 import re
-import shutil
 import subprocess
-
-import requests
-import streamlit as st
+import tempfile
+from pathlib import Path
 
 
 # ============================================================
@@ -20,14 +20,21 @@ st.set_page_config(
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
+
+GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 ONEDRIVE_USER = "my@011999.onmicrosoft.com"
 
-# -----------------------------
-# Posting Destinations
-# -----------------------------
+CHUNK_SIZE = 5 * 1024 * 1024
+
+MAX_UPLOAD_SIZE_MB = 2048
+
+
+# ============================================================
+# FACEBOOK DESTINATIONS
+# ============================================================
 
 PENDING_FOLDERS = {
     "Smart Deals India": "Pending_Posts",
@@ -39,38 +46,64 @@ GITHUB_WORKFLOWS = {
     "Movies and web series": "facebook-auto-poster-movies.yml",
 }
 
-GITHUB_OWNER = "ayushsharma011999-collab"
-GITHUB_REPO = "video-splitter-app"
-GITHUB_BRANCH = "main"
 
-GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
+# ============================================================
+# CUSTOM CSS
+# ============================================================
 
-CHUNK_SIZE = 5 * 1024 * 1024
+st.markdown(
+    """
+    <style>
 
-UPLOAD_DIR = "/tmp/uploads"
-OUTPUT_DIR = "/tmp/video_output"
+    .main-title {
+        font-size: 42px;
+        font-weight: 800;
+        margin-bottom: 0px;
+    }
 
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+    .sub-title {
+        font-size: 18px;
+        opacity: 0.75;
+        margin-bottom: 25px;
+    }
+
+    .status-box {
+        padding: 15px;
+        border-radius: 10px;
+        margin-top: 10px;
+        margin-bottom: 10px;
+    }
+
+    </style>
+    """,
+    unsafe_allow_html=True
+)
 
 
 # ============================================================
 # HEADER
 # ============================================================
 
-st.title("🎬 Pro Video Studio")
-st.caption("Video Splitter + OneDrive Pending Posts + Facebook Auto Poster")
+st.markdown(
+    '<div class="main-title">🎬 Pro Video Studio</div>',
+    unsafe_allow_html=True
+)
+
+st.markdown(
+    '<div class="sub-title">Video Splitter + OneDrive Pending Posts</div>',
+    unsafe_allow_html=True
+)
 
 
 # ============================================================
-# HELPER: GET AZURE SECRETS
+# HELPER FUNCTIONS
 # ============================================================
 
-def get_secret(name):
+def get_secret(name, default=""):
     try:
-        return st.secrets.get(name, "")
+        return st.secrets[name]
     except Exception:
-        return ""
+        return os.getenv(name, default)
 
 
 # ============================================================
@@ -78,18 +111,19 @@ def get_secret(name):
 # ============================================================
 
 def get_application_access_token():
+
     tenant_id = get_secret("AZURE_TENANT_ID")
     client_id = get_secret("AZURE_CLIENT_ID")
     client_secret = get_secret("AZURE_CLIENT_SECRET")
 
     if not tenant_id:
-        return None, "AZURE_TENANT_ID missing"
+        raise Exception("AZURE_TENANT_ID is missing.")
 
     if not client_id:
-        return None, "AZURE_CLIENT_ID missing"
+        raise Exception("AZURE_CLIENT_ID is missing.")
 
     if not client_secret:
-        return None, "AZURE_CLIENT_SECRET missing"
+        raise Exception("AZURE_CLIENT_SECRET is missing.")
 
     token_url = (
         f"https://login.microsoftonline.com/"
@@ -103,367 +137,449 @@ def get_application_access_token():
         "grant_type": "client_credentials",
     }
 
-    try:
-        response = requests.post(
-            token_url,
-            data=data,
-            timeout=60
+    response = requests.post(
+        token_url,
+        data=data,
+        timeout=60
+    )
+
+    if response.status_code != 200:
+        raise Exception(
+            f"Microsoft token error: "
+            f"{response.status_code} - {response.text}"
         )
 
-        if response.status_code != 200:
-            try:
-                error_data = response.json()
-            except Exception:
-                error_data = response.text
+    token_data = response.json()
 
-            return None, (
-                f"Microsoft Graph token failed "
-                f"(HTTP {response.status_code}): {error_data}"
-            )
+    access_token = token_data.get("access_token")
 
-        token = response.json().get("access_token")
+    if not access_token:
+        raise Exception("Microsoft Graph access token not received.")
 
-        if not token:
-            return None, "Access token missing in Microsoft response"
-
-        return token, None
-
-    except Exception as e:
-        return None, f"Token request error: {e}"
+    return access_token
 
 
 # ============================================================
-# ONEDRIVE - ENSURE FOLDER
+# GRAPH HEADERS
 # ============================================================
 
-def ensure_pending_folder(graph_token, folder_name):
-    headers = {
-        "Authorization": f"Bearer {graph_token}"
+def graph_headers(token):
+
+    return {
+        "Authorization": f"Bearer {token}"
     }
 
-    folder_url = (
+
+# ============================================================
+# GET ONEDRIVE
+# ============================================================
+
+def get_user_drive(token):
+
+    url = (
+        f"{GRAPH_BASE_URL}/users/"
+        f"{ONEDRIVE_USER}/drive"
+    )
+
+    response = requests.get(
+        url,
+        headers=graph_headers(token),
+        timeout=60
+    )
+
+    if response.status_code != 200:
+
+        raise Exception(
+            f"Unable to access OneDrive: "
+            f"{response.status_code} - {response.text}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# FIND ONEDRIVE FOLDER
+# ============================================================
+
+def get_folder(token, folder_name):
+
+    url = (
         f"{GRAPH_BASE_URL}/users/"
         f"{ONEDRIVE_USER}/drive/root:/{folder_name}"
     )
 
-    try:
-        response = requests.get(
-            folder_url,
-            headers=headers,
-            timeout=60
-        )
+    response = requests.get(
+        url,
+        headers=graph_headers(token),
+        timeout=60
+    )
 
-        if response.status_code == 200:
-            return True, response.json()
+    if response.status_code == 200:
+        return response.json()
 
-        if response.status_code != 404:
-            return False, (
-                f"Folder check failed "
-                f"(HTTP {response.status_code}): "
-                f"{response.text}"
-            )
+    if response.status_code == 404:
+        return None
 
-        # Folder does not exist - create it
-        create_url = (
-            f"{GRAPH_BASE_URL}/users/"
-            f"{ONEDRIVE_USER}/drive/root/children"
-        )
-
-        payload = {
-            "name": folder_name,
-            "folder": {},
-            "@microsoft.graph.conflictBehavior": "fail"
-        }
-
-        create_response = requests.post(
-            create_url,
-            headers={
-                **headers,
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=60
-        )
-
-        if create_response.status_code in (200, 201):
-            return True, create_response.json()
-
-        # In case another process created it meanwhile
-        if create_response.status_code == 409:
-            return True, {"name": folder_name}
-
-        return False, (
-            f"Folder creation failed "
-            f"(HTTP {create_response.status_code}): "
-            f"{create_response.text}"
-        )
-
-    except Exception as e:
-        return False, f"OneDrive folder error: {e}"
+    raise Exception(
+        f"Folder lookup failed: "
+        f"{response.status_code} - {response.text}"
+    )
 
 
 # ============================================================
-# ONEDRIVE - UPLOAD LARGE FILE
+# CREATE ONEDRIVE FOLDER
 # ============================================================
 
-def upload_large_file_to_onedrive(
-    graph_token,
-    local_file_path,
-    folder_name,
-    remote_file_name
-):
-    headers = {
-        "Authorization": f"Bearer {graph_token}"
-    }
+def create_folder(token, folder_name):
 
-    create_session_url = (
+    url = (
         f"{GRAPH_BASE_URL}/users/"
-        f"{ONEDRIVE_USER}/drive/root:/"
-        f"{folder_name}/{remote_file_name}:/"
-        f"createUploadSession"
+        f"{ONEDRIVE_USER}/drive/root/children"
     )
 
     payload = {
+        "name": folder_name,
+        "folder": {},
+        "@microsoft.graph.conflictBehavior": "fail"
+    }
+
+    response = requests.post(
+        url,
+        headers={
+            **graph_headers(token),
+            "Content-Type": "application/json"
+        },
+        json=payload,
+        timeout=60
+    )
+
+    if response.status_code not in [200, 201]:
+
+        raise Exception(
+            f"Folder creation failed: "
+            f"{response.status_code} - {response.text}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# GET OR CREATE FOLDER
+# ============================================================
+
+def get_or_create_folder(token, folder_name):
+
+    folder = get_folder(
+        token,
+        folder_name
+    )
+
+    if folder:
+        return folder
+
+    return create_folder(
+        token,
+        folder_name
+    )
+
+
+# ============================================================
+# UPLOAD SMALL FILE
+# ============================================================
+
+def upload_small_file(
+    token,
+    folder_id,
+    file_path,
+    file_name
+):
+
+    url = (
+        f"{GRAPH_BASE_URL}/users/"
+        f"{ONEDRIVE_USER}/drive/items/"
+        f"{folder_id}:/{file_name}:/content"
+    )
+
+    with open(file_path, "rb") as file:
+
+        response = requests.put(
+            url,
+            headers=graph_headers(token),
+            data=file,
+            timeout=600
+        )
+
+    if response.status_code not in [200, 201]:
+
+        raise Exception(
+            f"File upload failed: "
+            f"{response.status_code} - {response.text}"
+        )
+
+    return response.json()
+
+
+# ============================================================
+# UPLOAD LARGE FILE
+# ============================================================
+
+def upload_large_file(
+    token,
+    folder_id,
+    file_path,
+    file_name
+):
+
+    create_session_url = (
+        f"{GRAPH_BASE_URL}/users/"
+        f"{ONEDRIVE_USER}/drive/items/"
+        f"{folder_id}:/{file_name}:/createUploadSession"
+    )
+
+    session_payload = {
         "item": {
             "@microsoft.graph.conflictBehavior": "replace",
-            "name": remote_file_name
+            "name": file_name
         }
     }
 
-    try:
-        session_response = requests.post(
-            create_session_url,
-            headers={
-                **headers,
-                "Content-Type": "application/json"
-            },
-            json=payload,
-            timeout=60
+    session_response = requests.post(
+        create_session_url,
+        headers={
+            **graph_headers(token),
+            "Content-Type": "application/json"
+        },
+        json=session_payload,
+        timeout=60
+    )
+
+    if session_response.status_code not in [200, 201]:
+
+        raise Exception(
+            f"Upload session failed: "
+            f"{session_response.status_code} - "
+            f"{session_response.text}"
         )
 
-        if session_response.status_code not in (200, 201):
-            return False, (
-                f"Upload session creation failed "
-                f"(HTTP {session_response.status_code}): "
-                f"{session_response.text}"
+    upload_url = session_response.json().get(
+        "uploadUrl"
+    )
+
+    if not upload_url:
+        raise Exception("Upload URL was not returned.")
+
+    file_size = os.path.getsize(file_path)
+
+    start = 0
+
+    with open(file_path, "rb") as file:
+
+        while start < file_size:
+
+            end = min(
+                start + CHUNK_SIZE,
+                file_size
+            ) - 1
+
+            length = end - start + 1
+
+            file.seek(start)
+
+            chunk = file.read(length)
+
+            headers = {
+                "Content-Length": str(length),
+                "Content-Range":
+                    f"bytes {start}-{end}/{file_size}"
+            }
+
+            response = requests.put(
+                upload_url,
+                headers=headers,
+                data=chunk,
+                timeout=600
             )
 
-        session_data = session_response.json()
-        upload_url = session_data.get("uploadUrl")
+            if response.status_code not in [
+                200,
+                201,
+                202
+            ]:
 
-        if not upload_url:
-            return False, "uploadUrl missing from OneDrive response"
-
-        file_size = os.path.getsize(local_file_path)
-
-        with open(local_file_path, "rb") as file_handle:
-
-            start = 0
-
-            while start < file_size:
-
-                end = min(
-                    start + CHUNK_SIZE,
-                    file_size
-                ) - 1
-
-                chunk_length = end - start + 1
-
-                file_handle.seek(start)
-
-                chunk_data = file_handle.read(chunk_length)
-
-                chunk_headers = {
-                    "Content-Length": str(chunk_length),
-                    "Content-Range": (
-                        f"bytes {start}-{end}/{file_size}"
-                    ),
-                }
-
-                upload_response = requests.put(
-                    upload_url,
-                    headers=chunk_headers,
-                    data=chunk_data,
-                    timeout=300
+                raise Exception(
+                    f"Chunk upload failed: "
+                    f"{response.status_code} - "
+                    f"{response.text}"
                 )
 
-                if upload_response.status_code not in (
-                    200,
-                    201,
-                    202
-                ):
-                    return False, (
-                        f"Chunk upload failed "
-                        f"(HTTP {upload_response.status_code}): "
-                        f"{upload_response.text}"
-                    )
+            start = end + 1
 
-                start = end + 1
-
-        return True, "Uploaded successfully"
-
-    except Exception as e:
-        return False, f"OneDrive upload error: {e}"
+    return response.json()
 
 
 # ============================================================
-# FFMPEG - GET DURATION
+# UPLOAD FILE TO ONEDRIVE
 # ============================================================
 
-def get_video_duration(video_path):
+def upload_file_to_onedrive(
+    token,
+    folder_id,
+    file_path,
+    file_name
+):
 
-    ffprobe = shutil.which("ffprobe")
+    file_size = os.path.getsize(file_path)
 
-    if not ffprobe:
-        return None
+    if file_size <= 4 * 1024 * 1024:
 
-    try:
-        result = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                video_path
-            ],
-            capture_output=True,
-            text=True,
-            timeout=120
+        return upload_small_file(
+            token,
+            folder_id,
+            file_path,
+            file_name
         )
 
-        if result.returncode != 0:
-            return None
-
-        value = result.stdout.strip()
-
-        if not value:
-            return None
-
-        return float(value)
-
-    except Exception:
-        return None
+    return upload_large_file(
+        token,
+        folder_id,
+        file_path,
+        file_name
+    )
 
 
 # ============================================================
-# FFMPEG - SPLIT VIDEO
+# GET VIDEO DURATION
+# ============================================================
+
+def get_video_duration(file_path):
+
+    command = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration",
+        "-of",
+        "default=noprint_wrappers=1:nokey=1",
+        file_path
+    ]
+
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True
+    )
+
+    if result.returncode != 0:
+        raise Exception(
+            f"Unable to read video duration: "
+            f"{result.stderr}"
+        )
+
+    try:
+        return float(
+            result.stdout.strip()
+        )
+    except Exception:
+        raise Exception(
+            "Invalid video duration returned by ffprobe."
+        )
+
+
+# ============================================================
+# SPLIT VIDEO
 # ============================================================
 
 def split_video(
     input_path,
-    output_directory,
+    output_dir,
     clip_duration,
     aspect_ratio,
     watermark_text
 ):
 
-    ffmpeg = shutil.which("ffmpeg")
-
-    if not ffmpeg:
-        return False, [], "FFmpeg is not installed"
-
-    os.makedirs(output_directory, exist_ok=True)
-
-    duration = get_video_duration(input_path)
-
-    if duration is None:
-        return False, [], "Unable to detect video duration"
-
-    total_clips = int(
-        (duration + clip_duration - 0.001) // clip_duration
+    os.makedirs(
+        output_dir,
+        exist_ok=True
     )
 
-    if duration > total_clips * clip_duration:
-        total_clips += 1
+    duration = get_video_duration(
+        input_path
+    )
 
-    source_name = os.path.splitext(
-        os.path.basename(input_path)
-    )[0]
-
-    output_files = []
-
-    # --------------------------------------------------------
-    # Video filter
-    # --------------------------------------------------------
-
-    filters = []
-
-    if aspect_ratio == "9:16":
-
-        filters.append(
-            "scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920"
+    if duration <= 0:
+        raise Exception(
+            "Video duration is invalid."
         )
+
+    base_name = Path(
+        input_path
+    ).stem
+
+    # --------------------------------------------------------
+    # ORIGINAL
+    # --------------------------------------------------------
+
+    if aspect_ratio == "Original":
+
+        segment_filter = None
+
+    # --------------------------------------------------------
+    # 9:16
+    # --------------------------------------------------------
+
+    elif aspect_ratio == "9:16":
+
+        segment_filter = (
+            "crop=ih*9/16:ih"
+        )
+
+    # --------------------------------------------------------
+    # 16:9
+    # --------------------------------------------------------
 
     elif aspect_ratio == "16:9":
 
-        filters.append(
-            "scale=1920:1080:force_original_aspect_ratio=increase,"
-            "crop=1920:1080"
+        segment_filter = (
+            "crop=iw:iw*9/16"
         )
+
+    # --------------------------------------------------------
+    # 1:1
+    # --------------------------------------------------------
 
     elif aspect_ratio == "1:1":
 
-        filters.append(
-            "scale=1080:1080:force_original_aspect_ratio=increase,"
-            "crop=1080:1080"
+        segment_filter = (
+            "crop=min(iw\\,ih):min(iw\\,ih)"
         )
 
-    # Part number text
-    filters.append(
-        "drawtext="
-        "text='Part %d/%d':"
-        "x=(w-text_w)/2:"
-        "y=h-120:"
-        "fontsize=48:"
-        "fontcolor=white:"
-        "borderw=3:"
-        "bordercolor=black"
-        % (1, total_clips)
+    else:
+
+        segment_filter = None
+
+    total_clips = int(
+        (duration + clip_duration - 1)
+        // clip_duration
     )
 
-    if watermark_text.strip():
+    output_files = []
 
-        safe_watermark = (
-            watermark_text
-            .replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "\\'")
+    for index in range(total_clips):
+
+        start_time = index * clip_duration
+
+        output_name = (
+            f"{base_name}_clip_{index + 1:03d}.mp4"
         )
 
-        filters.append(
-            "drawtext="
-            f"text='{safe_watermark}':"
-            "x=40:"
-            "y=40:"
-            "fontsize=32:"
-            "fontcolor=white:"
-            "borderw=2:"
-            "bordercolor=black"
+        output_path = os.path.join(
+            output_dir,
+            output_name
         )
-
-    filter_complex = ",".join(filters)
-
-    # --------------------------------------------------------
-    # Generate clips
-    # --------------------------------------------------------
-
-    for part_number in range(1, total_clips + 1):
-
-        output_file = os.path.join(
-            output_directory,
-            f"{source_name}_clip_{part_number:03d}.mp4"
-        )
-
-        start_time = (
-            part_number - 1
-        ) * clip_duration
 
         command = [
-            ffmpeg,
+            "ffmpeg",
             "-y",
             "-ss",
             str(start_time),
@@ -471,51 +587,121 @@ def split_video(
             input_path,
             "-t",
             str(clip_duration),
-            "-vf",
-            filter_complex,
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "23",
-            "-c:a",
-            "aac",
-            "-movflags",
-            "+faststart",
-            output_file
         ]
 
-        try:
+        if segment_filter:
 
-            result = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=900
+            command.extend([
+                "-vf",
+                segment_filter,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "23",
+                "-c:a",
+                "aac",
+                "-movflags",
+                "+faststart"
+            ])
+
+        else:
+
+            command.extend([
+                "-c",
+                "copy"
+            ])
+
+        command.append(
+            output_path
+        )
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True
+        )
+
+        if result.returncode != 0:
+
+            raise Exception(
+                f"FFmpeg failed for clip "
+                f"{index + 1}: "
+                f"{result.stderr}"
             )
 
-            if result.returncode != 0:
+        # ----------------------------------------------------
+        # WATERMARK
+        # ----------------------------------------------------
 
-                return (
-                    False,
-                    output_files,
-                    result.stderr[-3000:]
+        if watermark_text.strip():
+
+            watermarked_path = os.path.join(
+                output_dir,
+                f"wm_{output_name}"
+            )
+
+            escaped_text = (
+                watermark_text
+                .replace("\\", "\\\\")
+                .replace(":", "\\:")
+                .replace("'", "\\'")
+            )
+
+            watermark_command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                output_path,
+                "-vf",
+                (
+                    "drawtext="
+                    f"text='{escaped_text}':"
+                    "fontcolor=white:"
+                    "fontsize=28:"
+                    "x=20:"
+                    "y=h-th-20:"
+                    "box=1:"
+                    "boxcolor=black@0.5:"
+                    "boxborderw=8"
+                ),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "medium",
+                "-crf",
+                "23",
+                "-c:a",
+                "copy",
+                "-movflags",
+                "+faststart",
+                watermarked_path
+            ]
+
+            watermark_result = subprocess.run(
+                watermark_command,
+                capture_output=True,
+                text=True
+            )
+
+            if watermark_result.returncode != 0:
+
+                raise Exception(
+                    "Watermark processing failed: "
+                    f"{watermark_result.stderr}"
                 )
 
-            if os.path.exists(output_file):
-
-                output_files.append(output_file)
-
-        except Exception as e:
-
-            return (
-                False,
-                output_files,
-                f"FFmpeg error: {e}"
+            os.replace(
+                watermarked_path,
+                output_path
             )
 
-    return True, output_files, None
+        output_files.append(
+            output_path
+        )
+
+    return output_files, total_clips
 
 
 # ============================================================
@@ -541,66 +727,66 @@ def create_metadata(
 
 
 # ============================================================
-# GITHUB ACTIONS
+# GITHUB ACTIONS DISPATCH
 # ============================================================
 
-def run_github_auto_poster(workflow_file):
+def run_github_auto_poster(
+    workflow_file
+):
 
-    github_token = get_secret("GITHUB_TOKEN")
+    github_token = get_secret(
+        "GITHUB_TOKEN"
+    )
+
+    github_repo = get_secret(
+        "GITHUB_REPO",
+        "ayushsharma011999-collab/video-splitter-app"
+    )
 
     if not github_token:
-        return False, "GITHUB_TOKEN missing in Streamlit Secrets"
 
-    workflow_url = (
-        "https://api.github.com/repos/"
-        f"{GITHUB_OWNER}/"
-        f"{GITHUB_REPO}/"
-        f"actions/workflows/"
+        raise Exception(
+            "GITHUB_TOKEN is missing from Streamlit Secrets."
+        )
+
+    url = (
+        f"https://api.github.com/repos/"
+        f"{github_repo}/actions/workflows/"
         f"{workflow_file}/dispatches"
     )
 
     headers = {
-        "Accept": "application/vnd.github+json",
-        "Authorization": f"Bearer {github_token}",
-        "X-GitHub-Api-Version": "2022-11-28",
-        "Content-Type": "application/json"
+        "Authorization":
+            f"Bearer {github_token}",
+        "Accept":
+            "application/vnd.github+json",
+        "X-GitHub-Api-Version":
+            "2022-11-28"
     }
 
     payload = {
-        "ref": GITHUB_BRANCH
+        "ref": "main"
     }
 
-    try:
+    response = requests.post(
+        url,
+        headers=headers,
+        json=payload,
+        timeout=60
+    )
 
-        response = requests.post(
-            workflow_url,
-            headers=headers,
-            json=payload,
-            timeout=60
+    if response.status_code not in [
+        201,
+        204
+    ]:
+
+        raise Exception(
+            f"GitHub workflow dispatch failed: "
+            f"{response.status_code} - "
+            f"{response.text}"
         )
 
-        if response.status_code == 204:
-
-            return (
-                True,
-                f"GitHub workflow '{workflow_file}' "
-                f"successfully started."
-            )
-
-        try:
-            error_data = response.json()
-        except Exception:
-            error_data = response.text
-
-        return False, (
-            f"GitHub workflow failed "
-            f"(HTTP {response.status_code}): "
-            f"{error_data}"
-        )
-
-    except Exception as e:
-
-        return False, f"GitHub request error: {e}"
+    return True
 
 
 # ============================================================
@@ -611,11 +797,7 @@ with st.sidebar:
 
     st.header("⚙️ Settings")
 
-    # --------------------------------------------------------
-    # Posting Destination
-    # --------------------------------------------------------
-
-    st.subheader("📁 Posting Destination")
+    st.subheader("📄 Facebook Destination")
 
     posting_destination = st.radio(
         "Select Facebook Page",
@@ -626,37 +808,39 @@ with st.sidebar:
         index=0
     )
 
-    # Dynamic configuration
-    selected_pending_folder = PENDING_FOLDERS[
-        posting_destination
-    ]
-
-    selected_github_workflow = GITHUB_WORKFLOWS[
-        posting_destination
-    ]
-
-    st.info(
-        f"📂 OneDrive Folder\n\n"
-        f"`{selected_pending_folder}`"
+    selected_pending_folder = (
+        PENDING_FOLDERS[
+            posting_destination
+        ]
     )
 
-    st.info(
-        f"⚙️ GitHub Workflow\n\n"
-        f"`{selected_github_workflow}`"
+    selected_github_workflow = (
+        GITHUB_WORKFLOWS[
+            posting_destination
+        ]
     )
 
     st.divider()
 
-    # --------------------------------------------------------
-    # Video Settings
-    # --------------------------------------------------------
-
     st.subheader("🎞️ Video Settings")
 
-    clip_duration = st.selectbox(
+    # ========================================================
+    # CLIP DURATION
+    # MAXIMUM = 20 MINUTES = 1200 SECONDS
+    # ========================================================
+
+    clip_duration = st.number_input(
         "Clip Duration (seconds)",
-        [15, 30, 45, 60, 90, 120],
-        index=3
+        min_value=15,
+        max_value=1200,
+        value=30,
+        step=5,
+        help="Maximum clip duration is 1200 seconds (20 minutes)."
+    )
+
+    st.caption(
+        f"⏱️ Selected: {clip_duration} seconds "
+        f"({clip_duration / 60:.1f} minutes)"
     )
 
     aspect_ratio = st.selectbox(
@@ -677,61 +861,29 @@ with st.sidebar:
 
     st.divider()
 
-    # --------------------------------------------------------
-    # GitHub Auto Poster
-    # --------------------------------------------------------
+    st.subheader("📘 Facebook")
 
-    st.subheader("🚀 Facebook Auto Poster")
+    st.caption(
+        f"Destination: {posting_destination}"
+    )
 
-    if st.button(
-        "▶️ Run Facebook Auto Poster",
-        use_container_width=True
-    ):
+    st.caption(
+        f"OneDrive Folder: {selected_pending_folder}"
+    )
 
-        with st.spinner(
-            f"Starting {posting_destination} workflow..."
-        ):
-
-            success, message = run_github_auto_poster(
-                selected_github_workflow
-            )
-
-        if success:
-
-            st.success(message)
-
-            st.info(
-                f"📁 `{selected_pending_folder}` se "
-                f"next pending video process hoga."
-            )
-
-        else:
-
-            st.error(message)
+    st.caption(
+        f"Workflow: {selected_github_workflow}"
+    )
 
 
 # ============================================================
-# MAIN AREA
+# MAIN UPLOAD
 # ============================================================
 
-st.markdown(
-    f"### 📌 Current Destination: `{posting_destination}`"
-)
-
-st.write(
-    f"Videos will be uploaded to "
-    f"**OneDrive → {selected_pending_folder}**"
-)
-
-st.divider()
-
-
-# ============================================================
-# VIDEO UPLOAD
-# ============================================================
+st.header("📤 Upload Video")
 
 uploaded_file = st.file_uploader(
-    "🎥 Upload Video",
+    "Choose a video",
     type=[
         "mp4",
         "mov",
@@ -743,342 +895,439 @@ uploaded_file = st.file_uploader(
 
 
 # ============================================================
-# PROCESS UPLOADED VIDEO
+# CONNECT ONEDRIVE
+# ============================================================
+
+st.divider()
+
+st.header("☁️ OneDrive")
+
+if "graph_token" not in st.session_state:
+
+    st.session_state.graph_token = None
+
+
+connect_col1, connect_col2 = st.columns(
+    [1, 3]
+)
+
+with connect_col1:
+
+    connect_onedrive = st.button(
+        "🔗 Connect OneDrive",
+        use_container_width=True
+    )
+
+
+if connect_onedrive:
+
+    try:
+
+        with st.spinner(
+            "Connecting to OneDrive..."
+        ):
+
+            token = get_application_access_token()
+
+            get_user_drive(token)
+
+            st.session_state.graph_token = token
+
+        st.success(
+            "OneDrive connected successfully."
+        )
+
+    except Exception as e:
+
+        st.error(
+            f"OneDrive connection failed: {e}"
+        )
+
+
+# ============================================================
+# ONEDRIVE STATUS
+# ============================================================
+
+if st.session_state.graph_token:
+
+    st.success(
+        f"🟢 OneDrive Ready — "
+        f"{selected_pending_folder} folder active"
+    )
+
+else:
+
+    st.warning(
+        "🟡 OneDrive not connected"
+    )
+
+
+# ============================================================
+# PROCESS VIDEO
 # ============================================================
 
 if uploaded_file:
 
-    temp_input_path = os.path.join(
-        UPLOAD_DIR,
-        uploaded_file.name
-    )
-
-    # Always write current uploaded file
-    with open(temp_input_path, "wb") as file_handle:
-        file_handle.write(uploaded_file.getbuffer())
-
-    st.success(
-        f"Video loaded: `{uploaded_file.name}`"
-    )
-
     st.divider()
 
-    # --------------------------------------------------------
-    # Video information
-    # --------------------------------------------------------
+    st.header("🎬 Video Processing")
 
-    duration = get_video_duration(
-        temp_input_path
+    file_size_mb = (
+        uploaded_file.size
+        / (1024 * 1024)
     )
 
-    if duration:
+    st.info(
+        f"File: {uploaded_file.name}  \n"
+        f"Size: {file_size_mb:.2f} MB"
+    )
 
-        st.info(
-            f"⏱️ Video Duration: "
-            f"{duration:.2f} seconds"
+    if file_size_mb > MAX_UPLOAD_SIZE_MB:
+
+        st.error(
+            f"File is too large. Maximum allowed "
+            f"size is {MAX_UPLOAD_SIZE_MB} MB."
         )
 
-    # --------------------------------------------------------
-    # Start Processing
-    # --------------------------------------------------------
+        st.stop()
 
-    if st.button(
-        "✂️ Split Video & Upload to OneDrive",
+    process_button = st.button(
+        "🚀 Split Video & Upload to OneDrive",
         type="primary",
         use_container_width=True
-    ):
+    )
 
-        # ----------------------------------------------------
-        # Clean previous output
-        # ----------------------------------------------------
+    if process_button:
 
-        if os.path.exists(OUTPUT_DIR):
-
-            shutil.rmtree(
-                OUTPUT_DIR,
-                ignore_errors=True
-            )
-
-        os.makedirs(
-            OUTPUT_DIR,
-            exist_ok=True
-        )
-
-        # ----------------------------------------------------
-        # Split video
-        # ----------------------------------------------------
-
-        with st.spinner(
-            "✂️ Video splitting in progress..."
-        ):
-
-            success, clip_files, error = split_video(
-                temp_input_path,
-                OUTPUT_DIR,
-                clip_duration,
-                aspect_ratio,
-                watermark_text
-            )
-
-        if not success:
+        if not st.session_state.graph_token:
 
             st.error(
-                f"Video splitting failed:\n\n{error}"
+                "Please connect OneDrive first."
             )
 
             st.stop()
 
-        if not clip_files:
-
-            st.error(
-                "No video clips were generated."
-            )
-
-            st.stop()
-
-        st.success(
-            f"✅ {len(clip_files)} video clips created."
+        token = (
+            st.session_state.graph_token
         )
 
-        # ----------------------------------------------------
-        # Show generated clips
-        # ----------------------------------------------------
+        temp_input = None
 
-        st.subheader("🎬 Generated Clips")
+        try:
 
-        for clip in clip_files:
+            # ==================================================
+            # CREATE TEMP DIRECTORY
+            # ==================================================
 
-            st.write(
-                f"📹 `{os.path.basename(clip)}`"
+            temp_dir = tempfile.mkdtemp(
+                prefix="pro_video_studio_"
             )
 
-        # ----------------------------------------------------
-        # Get Graph token
-        # ----------------------------------------------------
-
-        with st.spinner(
-            "🔐 Connecting to OneDrive..."
-        ):
-
-            graph_token, token_error = (
-                get_application_access_token()
-            )
-
-        if not graph_token:
-
-            st.error(token_error)
-
-            st.stop()
-
-        st.success(
-            "✅ Microsoft Graph authentication successful."
-        )
-
-        # ----------------------------------------------------
-        # Ensure selected OneDrive folder
-        # ----------------------------------------------------
-
-        with st.spinner(
-            f"📁 Checking OneDrive folder "
-            f"`{selected_pending_folder}`..."
-        ):
-
-            folder_ok, folder_data = (
-                ensure_pending_folder(
-                    graph_token,
-                    selected_pending_folder
-                )
-            )
-
-        if not folder_ok:
-
-            st.error(
-                f"OneDrive folder error:\n\n"
-                f"{folder_data}"
-            )
-
-            st.stop()
-
-        st.success(
-            f"✅ OneDrive folder ready: "
-            f"`{selected_pending_folder}`"
-        )
-
-        # ----------------------------------------------------
-        # Upload clips
-        # ----------------------------------------------------
-
-        st.subheader(
-            "☁️ Uploading Videos to OneDrive"
-        )
-
-        upload_errors = []
-
-        progress_bar = st.progress(0)
-
-        total_files = len(clip_files)
-
-        for index, clip_file in enumerate(
-            clip_files,
-            start=1
-        ):
-
-            remote_name = os.path.basename(
-                clip_file
-            )
-
-            st.write(
-                f"⬆️ Uploading "
-                f"`{remote_name}`..."
-            )
-
-            upload_success, upload_message = (
-                upload_large_file_to_onedrive(
-                    graph_token,
-                    clip_file,
-                    selected_pending_folder,
-                    remote_name
-                )
-            )
-
-            if upload_success:
-
-                st.success(
-                    f"✅ {remote_name}"
-                )
-
-            else:
-
-                st.error(
-                    f"❌ {remote_name}: "
-                    f"{upload_message}"
-                )
-
-                upload_errors.append(
-                    remote_name
-                )
-
-            progress_bar.progress(
-                index / total_files
-            )
-
-        # ----------------------------------------------------
-        # Metadata
-        # ----------------------------------------------------
-
-        source_video_name = (
-            os.path.basename(
+            input_path = os.path.join(
+                temp_dir,
                 uploaded_file.name
             )
-        )
 
-        metadata = create_metadata(
-            source_video=source_video_name,
-            total_clips=len(clip_files),
-            clip_duration=clip_duration,
-            aspect_ratio=aspect_ratio,
-            watermark_text=watermark_text
-        )
-
-        metadata_filename = (
-            os.path.splitext(
-                source_video_name
-            )[0]
-            + "_metadata.json"
-        )
-
-        metadata_path = os.path.join(
-            OUTPUT_DIR,
-            metadata_filename
-        )
-
-        with open(
-            metadata_path,
-            "w",
-            encoding="utf-8"
-        ) as metadata_file:
-
-            json.dump(
-                metadata,
-                metadata_file,
-                indent=2,
-                ensure_ascii=False
+            output_dir = os.path.join(
+                temp_dir,
+                "clips"
             )
 
-        st.write(
-            f"📝 Uploading metadata "
-            f"`{metadata_filename}`..."
-        )
+            os.makedirs(
+                output_dir,
+                exist_ok=True
+            )
 
-        metadata_success, metadata_message = (
-            upload_large_file_to_onedrive(
-                graph_token,
+            # ==================================================
+            # SAVE UPLOADED VIDEO
+            # ==================================================
+
+            with open(
+                input_path,
+                "wb"
+            ) as file:
+
+                file.write(
+                    uploaded_file.getbuffer()
+                )
+
+            temp_input = input_path
+
+            # ==================================================
+            # GET DURATION
+            # ==================================================
+
+            with st.spinner(
+                "Reading video information..."
+            ):
+
+                original_duration = (
+                    get_video_duration(
+                        input_path
+                    )
+                )
+
+            st.info(
+                f"Original video duration: "
+                f"{original_duration / 60:.2f} minutes"
+            )
+
+            # ==================================================
+            # SPLIT
+            # ==================================================
+
+            with st.spinner(
+                f"Splitting video into "
+                f"{clip_duration}-second clips..."
+            ):
+
+                clips, total_clips = split_video(
+                    input_path=input_path,
+                    output_dir=output_dir,
+                    clip_duration=clip_duration,
+                    aspect_ratio=aspect_ratio,
+                    watermark_text=watermark_text
+                )
+
+            st.success(
+                f"Video split completed. "
+                f"{total_clips} clip(s) created."
+            )
+
+            # ==================================================
+            # SHOW CLIPS
+            # ==================================================
+
+            st.subheader(
+                "📦 Generated Clips"
+            )
+
+            for clip in clips:
+
+                clip_size = (
+                    os.path.getsize(clip)
+                    / (1024 * 1024)
+                )
+
+                st.write(
+                    f"🎞️ {os.path.basename(clip)} "
+                    f"— {clip_size:.2f} MB"
+                )
+
+            # ==================================================
+            # GET/CREATE ONEDRIVE FOLDER
+            # ==================================================
+
+            with st.spinner(
+                f"Opening {selected_pending_folder}..."
+            ):
+
+                folder = get_or_create_folder(
+                    token,
+                    selected_pending_folder
+                )
+
+            folder_id = folder.get("id")
+
+            if not folder_id:
+
+                raise Exception(
+                    "OneDrive folder ID was not returned."
+                )
+
+            # ==================================================
+            # CREATE METADATA
+            # ==================================================
+
+            metadata = create_metadata(
+                source_video=uploaded_file.name,
+                total_clips=total_clips,
+                clip_duration=clip_duration,
+                aspect_ratio=aspect_ratio,
+                watermark_text=watermark_text
+            )
+
+            metadata_path = os.path.join(
+                temp_dir,
+                (
+                    f"{Path(uploaded_file.name).stem}"
+                    f"_metadata.json"
+                )
+            )
+
+            with open(
                 metadata_path,
-                selected_pending_folder,
-                metadata_filename
-            )
-        )
+                "w",
+                encoding="utf-8"
+            ) as file:
 
-        if metadata_success:
+                json.dump(
+                    metadata,
+                    file,
+                    indent=2,
+                    ensure_ascii=False
+                )
+
+            # ==================================================
+            # UPLOAD CLIPS
+            # ==================================================
+
+            st.subheader(
+                "☁️ Uploading to OneDrive"
+            )
+
+            progress = st.progress(
+                0
+            )
+
+            for index, clip in enumerate(
+                clips,
+                start=1
+            ):
+
+                clip_name = os.path.basename(
+                    clip
+                )
+
+                with st.spinner(
+                    f"Uploading {clip_name}..."
+                ):
+
+                    upload_file_to_onedrive(
+                        token=token,
+                        folder_id=folder_id,
+                        file_path=clip,
+                        file_name=clip_name
+                    )
+
+                progress.progress(
+                    index / len(clips)
+                )
+
+                st.write(
+                    f"✅ Uploaded: {clip_name}"
+                )
+
+            # ==================================================
+            # UPLOAD METADATA
+            # ==================================================
+
+            with st.spinner(
+                "Uploading metadata..."
+            ):
+
+                upload_file_to_onedrive(
+                    token=token,
+                    folder_id=folder_id,
+                    file_path=metadata_path,
+                    file_name=os.path.basename(
+                        metadata_path
+                    )
+                )
 
             st.success(
                 "✅ Metadata uploaded successfully."
             )
 
-        else:
-
-            st.error(
-                f"❌ Metadata upload failed: "
-                f"{metadata_message}"
-            )
-
-        # ----------------------------------------------------
-        # Final result
-        # ----------------------------------------------------
-
-        if upload_errors:
-
-            st.warning(
-                f"{len(upload_errors)} file(s) "
-                f"failed to upload."
-            )
-
-        else:
+            # ==================================================
+            # FINAL UPLOAD MESSAGE
+            # ==================================================
 
             st.success(
-                "🎉 All video clips uploaded successfully!"
+                f"🎉 All clips uploaded to "
+                f"`{selected_pending_folder}`"
             )
 
-        # ----------------------------------------------------
-        # Destination summary
-        # ----------------------------------------------------
+            st.info(
+                "The clips are now waiting for the "
+                "Facebook Auto Poster workflow."
+            )
 
-        st.divider()
+            # ==================================================
+            # CLEAN TEMP FILES
+            # ==================================================
 
-        st.subheader(
-            "📦 Posting Queue"
-        )
+            try:
 
-        st.write(
-            f"**Destination:** "
-            f"{posting_destination}"
-        )
+                import shutil
 
-        st.write(
-            f"**OneDrive Folder:** "
-            f"`{selected_pending_folder}`"
-        )
+                shutil.rmtree(
+                    temp_dir,
+                    ignore_errors=True
+                )
 
-        st.write(
-            f"**GitHub Workflow:** "
-            f"`{selected_github_workflow}`"
+            except Exception:
+                pass
+
+        except Exception as e:
+
+            st.error(
+                f"❌ Processing failed: {e}"
+            )
+
+            st.exception(e)
+
+
+# ============================================================
+# FACEBOOK AUTO POSTER
+# ============================================================
+
+st.divider()
+
+st.header("📢 Facebook Auto Poster")
+
+st.write(
+    f"Selected destination: **{posting_destination}**"
+)
+
+st.write(
+    f"Workflow: `{selected_github_workflow}`"
+)
+
+st.write(
+    f"OneDrive folder: `{selected_pending_folder}`"
+)
+
+run_poster = st.button(
+    "▶️ Run Facebook Auto Poster",
+    type="primary",
+    use_container_width=True
+)
+
+if run_poster:
+
+    try:
+
+        with st.spinner(
+            "Starting Facebook Auto Poster..."
+        ):
+
+            run_github_auto_poster(
+                selected_github_workflow
+            )
+
+        st.success(
+            "🚀 Facebook Auto Poster workflow started successfully!"
         )
 
         st.info(
-            "ℹ️ Video upload ke baad GitHub workflow "
-            "automatically start nahi hota. "
-            "Sidebar ka **Run Facebook Auto Poster** "
-            "button use karke workflow manually start "
-            "kar sakte ho. Scheduled GitHub workflow "
-            "apne cron ke according bhi run karega."
+            f"Destination: {posting_destination}"
         )
+
+    except Exception as e:
+
+        st.error(
+            f"❌ Unable to start Facebook Auto Poster: {e}"
+        )
+
+
+# ============================================================
+# FOOTER
+# ============================================================
+
+st.divider()
+
+st.caption(
+    "🎬 Pro Video Studio | "
+    "Streamlit + OneDrive + GitHub Actions"
+)
