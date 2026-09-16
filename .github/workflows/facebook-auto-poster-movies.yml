@@ -167,13 +167,115 @@ jobs:
 
 
       # ============================================================
-      # 8. CREATE FACEBOOK CAPTION
+      # 8. CREATE FACEBOOK CAPTION WITH CLIP NUMBER
       # ============================================================
       - name: Create Facebook Caption
         if: env.NO_VIDEO != 'true'
         shell: bash
         run: |
-          python -c "import json; d=json.load(open('metadata.json')); title=str(d.get('title','')).strip(); description=str(d.get('description','')).strip(); hashtags=d.get('hashtags',''); hashtags=' '.join(hashtags) if isinstance(hashtags,list) else str(hashtags).strip(); caption=' '.join(x for x in [title,description,hashtags] if x); caption=caption if caption else 'New movie/web series video 🎬'; open('caption.txt','w',encoding='utf-8').write(caption); print('Caption:',caption)"
+          python - <<'PY'
+          import json
+          import re
+          import os
+
+          # --------------------------------------------------------
+          # Read metadata
+          # --------------------------------------------------------
+          try:
+              with open("metadata.json", "r", encoding="utf-8") as f:
+                  data = json.load(f)
+          except Exception:
+              data = {}
+
+          # --------------------------------------------------------
+          # Get total clips
+          # --------------------------------------------------------
+          total_clips = data.get("total_clips", 0)
+
+          try:
+              total_clips = int(total_clips)
+          except:
+              total_clips = 0
+
+          # --------------------------------------------------------
+          # Get current clip number from filename
+          # Example:
+          # movie_clip_001.mp4 -> 1
+          # movie_clip_002.mp4 -> 2
+          # --------------------------------------------------------
+          video_name = os.environ.get("VIDEO_NAME", "")
+
+          match = re.search(
+              r"_clip_([0-9]+)\.mp4$",
+              video_name,
+              re.IGNORECASE
+          )
+
+          if match:
+              clip_number = int(match.group(1))
+          else:
+              clip_number = 1
+
+          # --------------------------------------------------------
+          # If metadata total is unavailable, use current clip number
+          # --------------------------------------------------------
+          if total_clips <= 0:
+              total_clips = clip_number
+
+          # --------------------------------------------------------
+          # Existing caption data
+          # --------------------------------------------------------
+          title = str(data.get("title", "")).strip()
+
+          description = str(
+              data.get("description", "")
+          ).strip()
+
+          hashtags = data.get("hashtags", "")
+
+          if isinstance(hashtags, list):
+              hashtags = " ".join(str(x) for x in hashtags)
+          else:
+              hashtags = str(hashtags).strip()
+
+          existing_caption = " ".join(
+              x for x in [
+                  title,
+                  description,
+                  hashtags
+              ]
+              if x
+          )
+
+          if not existing_caption:
+              existing_caption = "New movie/web series video 🎬"
+
+          # --------------------------------------------------------
+          # NEW FACEBOOK CAPTION
+          # --------------------------------------------------------
+          caption = (
+              f"🎬 Clip {clip_number}/{total_clips}\n\n"
+              f"{existing_caption}\n\n"
+              f"#Clip{clip_number}"
+          )
+
+          with open(
+              "caption.txt",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              f.write(caption)
+
+          print("=========================================")
+          print("Facebook Caption Created")
+          print("=========================================")
+          print(f"Video: {video_name}")
+          print(f"Clip Number: {clip_number}")
+          print(f"Total Clips: {total_clips}")
+          print("-----------------------------------------")
+          print(caption)
+          print("=========================================")
+          PY
 
 
       # ============================================================
