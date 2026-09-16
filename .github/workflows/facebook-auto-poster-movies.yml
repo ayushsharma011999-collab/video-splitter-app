@@ -68,8 +68,7 @@ jobs:
 
           curl -sS \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Pending_Posts:/children" \
-            -o pending_list.json \
+              "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Pending_Posts:/children"            -o pending_list.json \
             -w "%{http_code}" \
             > pending_http_code.txt
 
@@ -473,7 +472,7 @@ jobs:
 
           curl -sS \
             -H "Authorization: Bearer ${GRAPH_TOKEN}" \
-            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Posted" \
+            "https://graph.microsoft.com/v1.0/users/my@011999.onmicrosoft.com/drive/root:/Movies_Posted" \
             -o posted_folder.json \
             -w "%{http_code}" \
             > posted_http_code.txt
@@ -518,7 +517,7 @@ jobs:
             echo "Creating Posted folder..."
 
             printf '%s' \
-              '{"name":"Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
+              '{"name":"Movies_Posted","folder":{},"@microsoft.graph.conflictBehavior":"fail"}' \
               > create_posted.json
 
             curl -sS \
@@ -660,7 +659,7 @@ jobs:
 
           echo ""
           echo "OneDrive:"
-          echo "Pending_Posts -> Posted"
+          echo "Movies_Pending_Posts -> Movies_Posted"
 
           echo ""
           echo "Next scheduled run will process the next part."
