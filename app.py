@@ -1,3 +1,4 @@
+```python
 import streamlit as st
 import requests
 import os
@@ -7,6 +8,7 @@ import tempfile
 import shutil
 import io
 import zipfile
+import math
 from pathlib import Path
 
 
@@ -29,9 +31,12 @@ GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 
 ONEDRIVE_USER = "my@011999.onmicrosoft.com"
 
+# 5 MiB = exactly 16 × 320 KiB
 CHUNK_SIZE = 5 * 1024 * 1024
 
 MAX_UPLOAD_SIZE_MB = 2048
+
+SMALL_FILE_LIMIT = 4 * 1024 * 1024
 
 
 # ============================================================
@@ -108,23 +113,20 @@ st.markdown(
 # SESSION STATE
 # ============================================================
 
-if "graph_token" not in st.session_state:
-    st.session_state.graph_token = None
+DEFAULT_SESSION_STATE = {
+    "graph_token": None,
+    "download_zip": None,
+    "download_zip_name": None,
+    "generated_clip_names": [],
+    "generated_total_clips": 0,
+    "processing_complete": False,
+    "last_processed_video": None,
+}
 
-if "download_zip" not in st.session_state:
-    st.session_state.download_zip = None
+for key, value in DEFAULT_SESSION_STATE.items():
 
-if "download_zip_name" not in st.session_state:
-    st.session_state.download_zip_name = None
-
-if "generated_clip_names" not in st.session_state:
-    st.session_state.generated_clip_names = []
-
-if "generated_total_clips" not in st.session_state:
-    st.session_state.generated_total_clips = 0
-
-if "processing_complete" not in st.session_state:
-    st.session_state.processing_complete = False
+    if key not in st.session_state:
+        st.session_state[key] = value
 
 
 # ============================================================
@@ -134,14 +136,19 @@ if "processing_complete" not in st.session_state:
 def get_secret(name, default=""):
 
     try:
-        return st.secrets[name]
+
+        value = st.secrets.get(name)
+
+        if value is not None:
+            return str(value).strip()
 
     except Exception:
+        pass
 
-        return os.getenv(
-            name,
-            default
-        )
+    return os.getenv(
+        name,
+        default
+    )
 
 
 # ============================================================
@@ -197,10 +204,24 @@ def get_application_access_token():
 
     if response.status_code != 200:
 
+        try:
+            error_json = response.json()
+
+            error_description = (
+                error_json.get(
+                    "error_description"
+                )
+                or response.text
+            )
+
+        except Exception:
+
+            error_description = response.text
+
         raise Exception(
-            f"Microsoft token error: "
-            f"{response.status_code} - "
-            f"{response.text}"
+            f"Microsoft token error "
+            f"{response.status_code}: "
+            f"{error_description}"
         )
 
     token_data = response.json()
@@ -212,7 +233,7 @@ def get_application_access_token():
     if not access_token:
 
         raise Exception(
-            "Microsoft Graph access token not received."
+            "Microsoft Graph access token was not received."
         )
 
     return access_token
@@ -230,7 +251,7 @@ def graph_headers(token):
 
 
 # ============================================================
-# CHECK ONEDRIVE
+# GET USER DRIVE
 # ============================================================
 
 def get_user_drive(token):
@@ -249,8 +270,8 @@ def get_user_drive(token):
     if response.status_code != 200:
 
         raise Exception(
-            f"Unable to access OneDrive: "
-            f"{response.status_code} - "
+            f"Unable to access OneDrive "
+            f"{response.status_code}: "
             f"{response.text}"
         )
 
@@ -268,7 +289,8 @@ def get_folder(
 
     url = (
         f"{GRAPH_BASE_URL}/users/"
-        f"{ONEDRIVE_USER}/drive/root:/{folder_name}"
+        f"{ONEDRIVE_USER}/drive/root:/"
+        f"{folder_name}"
     )
 
     response = requests.get(
@@ -284,8 +306,8 @@ def get_folder(
         return None
 
     raise Exception(
-        f"Folder lookup failed: "
-        f"{response.status_code} - "
+        f"Folder lookup failed "
+        f"{response.status_code}: "
         f"{response.text}"
     )
 
@@ -307,27 +329,35 @@ def create_folder(
     payload = {
         "name": folder_name,
         "folder": {},
-        "@microsoft.graph.conflictBehavior": "fail"
+        "@microsoft.graph.conflictBehavior": "fail",
     }
 
     response = requests.post(
         url,
         headers={
             **graph_headers(token),
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         },
         json=payload,
-        timeout=60
+        timeout=60,
     )
 
-    if response.status_code not in [
-        200,
-        201
-    ]:
+    if response.status_code not in (200, 201):
+
+        # Folder may have been created by another request
+        if response.status_code == 409:
+
+            existing_folder = get_folder(
+                token,
+                folder_name
+            )
+
+            if existing_folder:
+                return existing_folder
 
         raise Exception(
-            f"Folder creation failed: "
-            f"{response.status_code} - "
+            f"Folder creation failed "
+            f"{response.status_code}: "
             f"{response.text}"
         )
 
@@ -380,6 +410,7 @@ def upload_small_file(
     )
 
     if progress_callback:
+
         progress_callback(
             0,
             file_size
@@ -392,29 +423,37 @@ def upload_small_file(
 
         response = requests.put(
             url,
-            headers=graph_headers(token),
+            headers={
+                **graph_headers(token),
+                "Content-Type": "application/octet-stream",
+            },
             data=file,
-            timeout=600
+            timeout=600,
         )
 
-    if response.status_code not in [
-        200,
-        201
-    ]:
+    if response.status_code not in (200, 201):
 
         raise Exception(
-            f"File upload failed: "
-            f"{response.status_code} - "
+            f"File upload failed "
+            f"{response.status_code}: "
             f"{response.text}"
         )
 
     if progress_callback:
+
         progress_callback(
             file_size,
             file_size
         )
 
-    return response.json()
+    try:
+        return response.json()
+
+    except Exception:
+
+        return {
+            "name": file_name
+        }
 
 
 # ============================================================
@@ -438,7 +477,7 @@ def upload_large_file(
     session_payload = {
         "item": {
             "@microsoft.graph.conflictBehavior": "replace",
-            "name": file_name
+            "name": file_name,
         }
     }
 
@@ -446,40 +485,46 @@ def upload_large_file(
         create_session_url,
         headers={
             **graph_headers(token),
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         },
         json=session_payload,
-        timeout=60
+        timeout=60,
     )
 
-    if session_response.status_code not in [
-        200,
-        201
-    ]:
+    if session_response.status_code not in (200, 201):
 
         raise Exception(
-            f"Upload session failed: "
-            f"{session_response.status_code} - "
+            f"Upload session failed "
+            f"{session_response.status_code}: "
             f"{session_response.text}"
         )
 
-    upload_url = session_response.json().get(
+    session_data = session_response.json()
+
+    upload_url = session_data.get(
         "uploadUrl"
     )
 
     if not upload_url:
 
         raise Exception(
-            "Upload URL was not returned."
+            "OneDrive did not return an upload URL."
         )
 
     file_size = os.path.getsize(
         file_path
     )
 
+    if file_size <= 0:
+
+        raise Exception(
+            f"Cannot upload empty file: {file_name}"
+        )
+
     start = 0
 
     if progress_callback:
+
         progress_callback(
             0,
             file_size
@@ -497,42 +542,51 @@ def upload_large_file(
                 file_size
             ) - 1
 
-            length = (
+            chunk_length = (
                 end -
                 start +
                 1
             )
 
-            file.seek(start)
-
-            chunk = file.read(
-                length
+            file.seek(
+                start
             )
 
-            headers = {
-                "Content-Length":
-                    str(length),
+            chunk = file.read(
+                chunk_length
+            )
 
-                "Content-Range":
-                    f"bytes {start}-{end}/{file_size}"
+            if not chunk:
+                raise Exception(
+                    "Unable to read upload chunk."
+                )
+
+            headers = {
+                "Content-Length": str(
+                    len(chunk)
+                ),
+                "Content-Range": (
+                    f"bytes {start}-{end}/"
+                    f"{file_size}"
+                ),
             }
 
             response = requests.put(
                 upload_url,
                 headers=headers,
                 data=chunk,
-                timeout=600
+                timeout=600,
             )
 
-            if response.status_code not in [
+            if response.status_code not in (
                 200,
                 201,
-                202
-            ]:
+                202,
+            ):
 
                 raise Exception(
-                    f"Chunk upload failed: "
-                    f"{response.status_code} - "
+                    f"Chunk upload failed "
+                    f"{response.status_code}: "
                     f"{response.text}"
                 )
 
@@ -545,11 +599,25 @@ def upload_large_file(
                     file_size
                 )
 
-    return response.json()
+            # Final chunk
+            if start >= file_size:
+
+                try:
+                    return response.json()
+
+                except Exception:
+
+                    return {
+                        "name": file_name
+                    }
+
+    return {
+        "name": file_name
+    }
 
 
 # ============================================================
-# UPLOAD FILE
+# UPLOAD FILE TO ONEDRIVE
 # ============================================================
 
 def upload_file_to_onedrive(
@@ -564,14 +632,14 @@ def upload_file_to_onedrive(
         file_path
     )
 
-    if file_size <= 4 * 1024 * 1024:
+    if file_size <= SMALL_FILE_LIMIT:
 
         return upload_small_file(
             token=token,
             folder_id=folder_id,
             file_path=file_path,
             file_name=file_name,
-            progress_callback=progress_callback
+            progress_callback=progress_callback,
         )
 
     return upload_large_file(
@@ -579,7 +647,7 @@ def upload_file_to_onedrive(
         folder_id=folder_id,
         file_path=file_path,
         file_name=file_name,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
     )
 
 
@@ -599,37 +667,46 @@ def get_video_duration(
         "format=duration",
         "-of",
         "default=noprint_wrappers=1:nokey=1",
-        file_path
+        file_path,
     ]
 
     result = subprocess.run(
         command,
         capture_output=True,
-        text=True
+        text=True,
+        timeout=120,
     )
 
     if result.returncode != 0:
 
         raise Exception(
-            f"Unable to read video duration: "
-            f"{result.stderr}"
+            "FFprobe could not read the video.\n\n"
+            f"{result.stderr[-3000:]}"
         )
 
     try:
 
-        return float(
+        duration = float(
             result.stdout.strip()
         )
 
     except Exception:
 
         raise Exception(
-            "Invalid video duration."
+            "FFprobe returned an invalid video duration."
         )
+
+    if not math.isfinite(duration) or duration <= 0:
+
+        raise Exception(
+            "Video duration is invalid."
+        )
+
+    return duration
 
 
 # ============================================================
-# CREATE LOCAL ZIP
+# LOCAL ZIP
 # ============================================================
 
 def create_local_zip(
@@ -642,17 +719,19 @@ def create_local_zip(
     with zipfile.ZipFile(
         zip_buffer,
         mode="w",
-        compression=zipfile.ZIP_DEFLATED
+        compression=zipfile.ZIP_DEFLATED,
     ) as zip_file:
 
         for clip in clips:
 
-            zip_file.write(
-                clip,
-                arcname=os.path.basename(
-                    clip
+            if os.path.exists(clip):
+
+                zip_file.write(
+                    clip,
+                    arcname=os.path.basename(
+                        clip
+                    ),
                 )
-            )
 
     zip_buffer.seek(0)
 
@@ -663,12 +742,32 @@ def create_local_zip(
 
     return (
         zip_buffer.getvalue(),
-        zip_name
+        zip_name,
     )
 
 
 # ============================================================
-# SPLIT VIDEO + EFFECTS + EPISODE/PART OVERLAY
+# DRAW TEXT ESCAPE
+# ============================================================
+
+def escape_drawtext(
+    text
+):
+
+    return (
+        str(text)
+        .replace("\\", "\\\\")
+        .replace(":", "\\:")
+        .replace("'", "\\'")
+        .replace("%", "\\%")
+        .replace(",", "\\,")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+
+
+# ============================================================
+# SPLIT VIDEO
 # ============================================================
 
 def split_video(
@@ -683,7 +782,7 @@ def split_video(
     enable_motion=True,
     enable_fade=True,
     enable_text=True,
-    progress_callback=None
+    progress_callback=None,
 ):
 
     os.makedirs(
@@ -696,6 +795,7 @@ def split_video(
     )
 
     if duration <= 0:
+
         raise Exception(
             "Video duration is invalid."
         )
@@ -710,47 +810,38 @@ def split_video(
 
     output_files = []
 
-    total_clips = int(
-        (duration + clip_duration - 1)
-        // clip_duration
+    total_clips = max(
+        1,
+        math.ceil(
+            duration /
+            float(clip_duration)
+        )
     )
 
-    def escape_drawtext(text):
-
-        return (
-            str(text)
-            .replace("\\", "\\\\")
-            .replace(":", "\\:")
-            .replace("'", "\\'")
-            .replace("%", "\\%")
-            .replace(",", "\\,")
-            .replace("[", "\\[")
-            .replace("]", "\\]")
-        )
-
     # --------------------------------------------------------
-    # EFFECT PRESET
+    # EFFECT SETTINGS
     # --------------------------------------------------------
 
     if effect_preset == "Clean":
 
-        zoom_amount = 0.0
-        motion_amount = 0.0
+        zoom_scale = 1.0
+        motion_pixels = 0
 
     elif effect_preset == "Dynamic":
 
-        zoom_amount = 0.025
-        motion_amount = 2.0
+        zoom_scale = 1.035
+        motion_pixels = 4
 
     elif effect_preset == "Cinematic":
 
-        zoom_amount = 0.018
-        motion_amount = 1.0
+        zoom_scale = 1.018
+        motion_pixels = 2
 
     else:
 
-        zoom_amount = 0.022
-        motion_amount = 1.5
+        # Trending
+        zoom_scale = 1.022
+        motion_pixels = 3
 
     # --------------------------------------------------------
     # INITIAL PROGRESS
@@ -765,7 +856,7 @@ def split_video(
         )
 
     # --------------------------------------------------------
-    # PROCESS EACH CLIP
+    # PROCESS CLIPS
     # --------------------------------------------------------
 
     for index in range(
@@ -776,8 +867,21 @@ def split_video(
 
         start_time = (
             index *
-            clip_duration
+            float(clip_duration)
         )
+
+        remaining = (
+            duration -
+            start_time
+        )
+
+        current_duration = min(
+            float(clip_duration),
+            remaining
+        )
+
+        if current_duration <= 0:
+            break
 
         output_name = (
             f"{base_name}_clip_"
@@ -787,33 +891,6 @@ def split_video(
         output_path = os.path.join(
             output_dir,
             output_name
-        )
-
-        # ----------------------------------------------------
-        # EPISODE + PART TEXT
-        # ----------------------------------------------------
-
-        episode_text = (
-            f"EP {int(episode_number):02d} "
-            f"• PART {part_number:02d}/{total_clips}"
-        )
-
-        escaped_file_name = (
-            escape_drawtext(
-                original_file_name
-            )
-        )
-
-        escaped_episode_text = (
-            escape_drawtext(
-                episode_text
-            )
-        )
-
-        escaped_watermark = (
-            escape_drawtext(
-                watermark_text
-            )
         )
 
         filters = []
@@ -841,20 +918,21 @@ def split_video(
             )
 
         # ----------------------------------------------------
-        # SMOOTH ZOOM
+        # ZOOM
         # ----------------------------------------------------
 
         if (
             enable_zoom
-            and zoom_amount > 0
+            and zoom_scale > 1.0
         ):
 
             zoom_filter = (
-                "scale="
-                "iw*1.022:"
-                "ih*1.022,"
-                "crop=iw/1.022:"
-                "ih/1.022"
+                f"scale="
+                f"iw*{zoom_scale}:"
+                f"ih*{zoom_scale},"
+                f"crop="
+                f"iw/{zoom_scale}:"
+                f"ih/{zoom_scale}"
             )
 
             filters.append(
@@ -862,19 +940,29 @@ def split_video(
             )
 
         # ----------------------------------------------------
-        # SUBTLE MOTION
+        # SAFE SUBTLE MOTION
+        #
+        # Previous version used:
+        # crop=iw:ih:x=...
+        #
+        # That can fail because crop size was equal
+        # to input size while x was moving.
+        #
+        # New version creates a slightly larger canvas
+        # and crops a smaller area safely.
         # ----------------------------------------------------
 
         if (
             enable_motion
-            and motion_amount > 0
+            and motion_pixels > 0
         ):
 
             motion_filter = (
                 "crop="
-                "iw:"
-                "ih:"
-                f"x='{motion_amount}*sin(n/45)':"
+                f"iw-{motion_pixels * 2}:"
+                f"ih:"
+                f"x={motion_pixels}+"
+                f"{motion_pixels}*sin(n/30):"
                 "y=0"
             )
 
@@ -883,27 +971,26 @@ def split_video(
             )
 
         # ----------------------------------------------------
-        # FADE IN / OUT
+        # FADE
         # ----------------------------------------------------
 
         if enable_fade:
 
-            fade_duration = 0.35
-
-            actual_clip_duration = min(
-                float(clip_duration),
-                float(duration - start_time)
+            fade_duration = min(
+                0.35,
+                current_duration / 2
             )
 
             fade_out_start = max(
-                actual_clip_duration -
+                current_duration -
                 fade_duration,
                 0
             )
 
             filters.append(
                 f"fade=t=in:"
-                f"st=0:d={fade_duration}"
+                f"st=0:"
+                f"d={fade_duration}"
             )
 
             filters.append(
@@ -913,11 +1000,31 @@ def split_video(
             )
 
         # ----------------------------------------------------
-        # FILE NAME - TOP RIGHT
+        # TEXT
         # ----------------------------------------------------
 
         if enable_text:
 
+            episode_text = (
+                f"EP {int(episode_number):02d} "
+                f"• PART "
+                f"{part_number:02d}/"
+                f"{total_clips:02d}"
+            )
+
+            escaped_file_name = (
+                escape_drawtext(
+                    original_file_name
+                )
+            )
+
+            escaped_episode_text = (
+                escape_drawtext(
+                    episode_text
+                )
+            )
+
+            # File name - top right
             filters.append(
                 (
                     "drawtext="
@@ -932,10 +1039,7 @@ def split_video(
                 )
             )
 
-            # ------------------------------------------------
-            # EPISODE + PART
-            # ------------------------------------------------
-
+            # Episode + part - bottom right
             filters.append(
                 (
                     "drawtext="
@@ -956,6 +1060,12 @@ def split_video(
 
         if watermark_text.strip():
 
+            escaped_watermark = (
+                escape_drawtext(
+                    watermark_text.strip()
+                )
+            )
+
             filters.append(
                 (
                     "drawtext="
@@ -971,61 +1081,110 @@ def split_video(
             )
 
         # ----------------------------------------------------
-        # VIDEO FILTER
+        # FILTER
         # ----------------------------------------------------
 
-        if not filters:
-
-            video_filter = "null"
-
-        else:
+        if filters:
 
             video_filter = ",".join(
                 filters
             )
 
+        else:
+
+            video_filter = "null"
+
         # ----------------------------------------------------
-        # FFMPEG COMMAND
+        # FFMPEG
         # ----------------------------------------------------
 
         command = [
             "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
             "-y",
+
             "-ss",
             str(start_time),
+
             "-i",
             input_path,
+
             "-t",
-            str(clip_duration),
+            str(current_duration),
+
             "-vf",
             video_filter,
+
+            "-map",
+            "0:v:0",
+
+            "-map",
+            "0:a?",
+
             "-c:v",
             "libx264",
+
             "-preset",
             "medium",
+
             "-crf",
             "23",
+
+            "-pix_fmt",
+            "yuv420p",
+
             "-c:a",
             "aac",
+
             "-b:a",
             "128k",
+
             "-movflags",
             "+faststart",
-            output_path
+
+            output_path,
         ]
 
         result = subprocess.run(
             command,
             capture_output=True,
-            text=True
+            text=True,
+            timeout=3600,
         )
 
         if result.returncode != 0:
 
+            error_text = (
+                result.stderr.strip()
+                or result.stdout.strip()
+                or "Unknown FFmpeg error."
+            )
+
             raise Exception(
                 f"FFmpeg failed for clip "
-                f"{part_number}: "
-                f"{result.stderr}"
+                f"{part_number}/{total_clips}:\n\n"
+                f"{error_text[-5000:]}"
+            )
+
+        if not os.path.exists(
+            output_path
+        ):
+
+            raise Exception(
+                f"FFmpeg completed but output file "
+                f"was not created: {output_name}"
+            )
+
+        output_size = os.path.getsize(
+            output_path
+        )
+
+        if output_size <= 0:
+
+            raise Exception(
+                f"Generated clip is empty: {output_name}"
             )
 
         output_files.append(
@@ -1033,7 +1192,7 @@ def split_video(
         )
 
         # ----------------------------------------------------
-        # SPLIT PROGRESS
+        # PROGRESS
         # ----------------------------------------------------
 
         if progress_callback:
@@ -1044,12 +1203,18 @@ def split_video(
                 (
                     f"Created clip "
                     f"{part_number}/{total_clips}"
-                )
+                ),
             )
+
+    if not output_files:
+
+        raise Exception(
+            "No video clips were generated."
+        )
 
     return (
         output_files,
-        total_clips
+        len(output_files),
     )
 
 
@@ -1062,16 +1227,24 @@ def create_metadata(
     total_clips,
     clip_duration,
     aspect_ratio,
-    watermark_text
+    watermark_text,
+    episode_number,
+    effect_preset,
 ):
 
     return {
         "source_video": source_video,
         "total_clips": total_clips,
-        "clip_duration_seconds": clip_duration,
+        "clip_duration_seconds": int(
+            clip_duration
+        ),
+        "episode_number": int(
+            episode_number
+        ),
         "aspect_ratio": aspect_ratio,
         "watermark_text": watermark_text,
-        "status": "Pending"
+        "effect_preset": effect_preset,
+        "status": "Pending",
     }
 
 
@@ -1098,6 +1271,12 @@ def run_github_auto_poster(
             "GITHUB_TOKEN is missing from Streamlit Secrets."
         )
 
+    if not github_repo:
+
+        raise Exception(
+            "GITHUB_REPO is missing."
+        )
+
     url = (
         f"https://api.github.com/repos/"
         f"{github_repo}/actions/workflows/"
@@ -1112,7 +1291,7 @@ def run_github_auto_poster(
             "application/vnd.github+json",
 
         "X-GitHub-Api-Version":
-            "2022-11-28"
+            "2022-11-28",
     }
 
     payload = {
@@ -1123,17 +1302,17 @@ def run_github_auto_poster(
         url,
         headers=headers,
         json=payload,
-        timeout=60
+        timeout=60,
     )
 
-    if response.status_code not in [
+    if response.status_code not in (
         201,
-        204
-    ]:
+        204,
+    ):
 
         raise Exception(
-            f"GitHub workflow dispatch failed: "
-            f"{response.status_code} - "
+            f"GitHub workflow dispatch failed "
+            f"{response.status_code}: "
             f"{response.text}"
         )
 
@@ -1146,7 +1325,13 @@ def run_github_auto_poster(
 
 with st.sidebar:
 
-    st.header("⚙️ Settings")
+    st.header(
+        "⚙️ Settings"
+    )
+
+    # --------------------------------------------------------
+    # FACEBOOK
+    # --------------------------------------------------------
 
     st.subheader(
         "📘 Facebook Settings"
@@ -1156,9 +1341,9 @@ with st.sidebar:
         "Select Facebook Page",
         [
             "Smart Deals India",
-            "Movies and web series"
+            "Movies and web series",
         ],
-        index=0
+        index=0,
     )
 
     selected_pending_folder = (
@@ -1175,13 +1360,13 @@ with st.sidebar:
 
     st.divider()
 
+    # --------------------------------------------------------
+    # VIDEO
+    # --------------------------------------------------------
+
     st.subheader(
         "🎞️ Video Settings"
     )
-
-    # --------------------------------------------------------
-    # CLIP DURATION
-    # --------------------------------------------------------
 
     clip_duration = st.number_input(
         "Clip Duration (seconds)",
@@ -1192,7 +1377,7 @@ with st.sidebar:
         help=(
             "Maximum duration is "
             "1200 seconds (20 minutes)."
-        )
+        ),
     )
 
     minutes = int(
@@ -1218,10 +1403,6 @@ with st.sidebar:
         max_value=9999,
         value=1,
         step=1,
-        help=(
-            "This number will appear "
-            "inside every generated clip."
-        )
     )
 
     st.caption(
@@ -1230,7 +1411,7 @@ with st.sidebar:
     )
 
     # --------------------------------------------------------
-    # ASPECT RATIO
+    # ASPECT
     # --------------------------------------------------------
 
     aspect_ratio = st.selectbox(
@@ -1239,9 +1420,9 @@ with st.sidebar:
             "Original",
             "9:16",
             "16:9",
-            "1:1"
+            "1:1",
         ],
-        index=0
+        index=0,
     )
 
     # --------------------------------------------------------
@@ -1254,41 +1435,36 @@ with st.sidebar:
             "Trending",
             "Clean",
             "Dynamic",
-            "Cinematic"
+            "Cinematic",
         ],
         index=0,
         help=(
-            "Trending uses subtle zoom, "
-            "motion and fade effects."
-        )
+            "Preset controls subtle video effects."
+        ),
     )
 
-    # --------------------------------------------------------
-    # INDIVIDUAL EFFECTS
-    # --------------------------------------------------------
-
     st.markdown(
-        "**✨ Effects**"
+        "**✨ Individual Effects**"
     )
 
     enable_zoom = st.checkbox(
         "🔍 Smooth Zoom",
-        value=True
+        value=True,
     )
 
     enable_motion = st.checkbox(
         "🎥 Subtle Motion",
-        value=True
+        value=True,
     )
 
     enable_fade = st.checkbox(
         "🌊 Fade In / Out",
-        value=True
+        value=True,
     )
 
     enable_text = st.checkbox(
         "📝 Episode + Part Text",
-        value=True
+        value=True,
     )
 
     # --------------------------------------------------------
@@ -1298,11 +1474,11 @@ with st.sidebar:
     watermark_text = st.text_input(
         "Watermark Text",
         value="",
-        placeholder="Example: @MyPage"
+        placeholder="Example: @MyPage",
     )
 
     # --------------------------------------------------------
-    # PREVIEW
+    # PREVIEW INFORMATION
     # --------------------------------------------------------
 
     st.caption(
@@ -1345,17 +1521,17 @@ uploaded_file = st.file_uploader(
         "mov",
         "mkv",
         "avi",
-        "webm"
+        "webm",
     ],
     help=(
-        "Select the video that you want "
+        "Select the video you want "
         "to split into clips."
-    )
+    ),
 )
 
 
 # ============================================================
-# VIDEO UPLOAD / RECEIVE STATUS
+# UPLOAD STATUS
 # ============================================================
 
 if uploaded_file:
@@ -1384,14 +1560,14 @@ if uploaded_file:
         '<div class="progress-text">'
         '✅ Video received by Streamlit — 100%'
         '</div>',
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
     st.caption(
-        "Note: Streamlit's native file uploader "
-        "does not expose the browser's live upload "
-        "percentage. The progress above confirms "
-        "that the selected file has been received."
+        "Streamlit's native uploader does not "
+        "expose the browser's live upload percentage. "
+        "This confirms that the file is available "
+        "to the application."
     )
 
     if file_size_mb > MAX_UPLOAD_SIZE_MB:
@@ -1405,7 +1581,7 @@ if uploaded_file:
 
 
 # ============================================================
-# ONEDRIVE CONNECTION
+# ONEDRIVE
 # ============================================================
 
 st.divider()
@@ -1422,7 +1598,8 @@ with connect_col1:
 
     connect_onedrive = st.button(
         "🔗 Connect OneDrive",
-        use_container_width=True
+        use_container_width=True,
+        key="connect_onedrive_button",
     )
 
 
@@ -1493,14 +1670,15 @@ if uploaded_file:
     )
 
     st.info(
-        f"File: {uploaded_file.name}  \n"
+        f"File: {uploaded_file.name}\n\n"
         f"Size: {file_size_mb:.2f} MB"
     )
 
     process_button = st.button(
         "🚀 Split Video & Upload to OneDrive",
         type="primary",
-        use_container_width=True
+        use_container_width=True,
+        key="process_video_button",
     )
 
     if process_button:
@@ -1522,30 +1700,30 @@ if uploaded_file:
         try:
 
             # ------------------------------------------------
-            # RESET PREVIOUS DOWNLOAD
+            # RESET
             # ------------------------------------------------
 
             st.session_state.download_zip = None
-
             st.session_state.download_zip_name = None
-
             st.session_state.generated_clip_names = []
-
             st.session_state.generated_total_clips = 0
-
             st.session_state.processing_complete = False
 
             # ------------------------------------------------
-            # TEMP DIRECTORY
+            # TEMP
             # ------------------------------------------------
 
             temp_dir = tempfile.mkdtemp(
                 prefix="pro_video_studio_"
             )
 
+            safe_input_name = (
+                Path(uploaded_file.name).name
+            )
+
             input_path = os.path.join(
                 temp_dir,
-                uploaded_file.name
+                safe_input_name
             )
 
             output_dir = os.path.join(
@@ -1559,7 +1737,7 @@ if uploaded_file:
             )
 
             # ------------------------------------------------
-            # SAVE UPLOADED VIDEO
+            # SAVE VIDEO
             # ------------------------------------------------
 
             st.subheader(
@@ -1604,7 +1782,7 @@ if uploaded_file:
                         chunk
                     )
 
-                    if total_file_size > 0:
+                    if total_file_size:
 
                         current_progress = (
                             written_bytes /
@@ -1616,7 +1794,10 @@ if uploaded_file:
                         current_progress = 1.0
 
                     current_progress = min(
-                        current_progress,
+                        max(
+                            current_progress,
+                            0.0
+                        ),
                         1.0
                     )
 
@@ -1637,11 +1818,11 @@ if uploaded_file:
             )
 
             save_status.success(
-                "✅ Video successfully received and saved — 100%"
+                "✅ Video successfully saved — 100%"
             )
 
             # ------------------------------------------------
-            # VIDEO DURATION
+            # DURATION
             # ------------------------------------------------
 
             with st.spinner(
@@ -1659,13 +1840,23 @@ if uploaded_file:
                 60
             )
 
+            expected_clips = max(
+                1,
+                math.ceil(
+                    original_duration /
+                    float(clip_duration)
+                )
+            )
+
             st.info(
-                f"Original video duration: "
-                f"{original_minutes:.2f} minutes"
+                f"🎬 Original duration: "
+                f"{original_minutes:.2f} minutes\n\n"
+                f"🎞️ Expected clips: "
+                f"{expected_clips}"
             )
 
             # ------------------------------------------------
-            # SPLIT PROGRESS
+            # SPLIT
             # ------------------------------------------------
 
             st.subheader(
@@ -1686,23 +1877,18 @@ if uploaded_file:
                 message
             ):
 
-                if total > 0:
-
-                    percentage = (
-                        current /
-                        total
-                    )
-
-                else:
-
-                    percentage = 0
+                percentage = (
+                    current / total
+                    if total > 0
+                    else 0
+                )
 
                 percentage = min(
                     max(
                         percentage,
-                        0
+                        0.0
                     ),
-                    1
+                    1.0
                 )
 
                 split_progress.progress(
@@ -1719,10 +1905,6 @@ if uploaded_file:
                     f"{current}/{total}"
                 )
 
-            # ------------------------------------------------
-            # SPLIT
-            # ------------------------------------------------
-
             clips, total_clips = split_video(
                 input_path=input_path,
                 output_dir=output_dir,
@@ -1735,7 +1917,7 @@ if uploaded_file:
                 enable_motion=enable_motion,
                 enable_fade=enable_fade,
                 enable_text=enable_text,
-                progress_callback=split_progress_callback
+                progress_callback=split_progress_callback,
             )
 
             split_progress.progress(
@@ -1743,7 +1925,7 @@ if uploaded_file:
             )
 
             split_status.success(
-                f"✅ Video splitting completed — 100%"
+                "✅ Video splitting completed — 100%"
             )
 
             split_count_status.success(
@@ -1751,7 +1933,7 @@ if uploaded_file:
             )
 
             # ------------------------------------------------
-            # SAVE CLIP INFO IN SESSION
+            # SESSION CLIP INFO
             # ------------------------------------------------
 
             st.session_state.generated_total_clips = (
@@ -1759,12 +1941,38 @@ if uploaded_file:
             )
 
             st.session_state.generated_clip_names = [
-                os.path.basename(clip)
+                os.path.basename(
+                    clip
+                )
                 for clip in clips
             ]
 
             # ------------------------------------------------
-            # CREATE LOCAL ZIP
+            # GENERATED CLIPS
+            # ------------------------------------------------
+
+            st.subheader(
+                "📦 Generated Clips"
+            )
+
+            for clip in clips:
+
+                clip_size_mb = (
+                    os.path.getsize(
+                        clip
+                    ) /
+                    (1024 * 1024)
+                )
+
+                st.write(
+                    f"🎞️ "
+                    f"{os.path.basename(clip)} "
+                    f"— "
+                    f"{clip_size_mb:.2f} MB"
+                )
+
+            # ------------------------------------------------
+            # LOCAL ZIP
             # ------------------------------------------------
 
             with st.spinner(
@@ -1788,30 +1996,6 @@ if uploaded_file:
             )
 
             # ------------------------------------------------
-            # SHOW CLIPS
-            # ------------------------------------------------
-
-            st.subheader(
-                "📦 Generated Clips"
-            )
-
-            for clip in clips:
-
-                clip_size = (
-                    os.path.getsize(
-                        clip
-                    ) /
-                    (1024 * 1024)
-                )
-
-                st.write(
-                    f"🎞️ "
-                    f"{os.path.basename(clip)} "
-                    f"— "
-                    f"{clip_size:.2f} MB"
-                )
-
-            # ------------------------------------------------
             # LOCAL DOWNLOAD
             # ------------------------------------------------
 
@@ -1820,8 +2004,8 @@ if uploaded_file:
             )
 
             st.success(
-                f"✅ {total_clips} clip(s) are ready "
-                f"for local download."
+                f"✅ {total_clips} clip(s) "
+                f"are ready for local download."
             )
 
             download_col1, download_col2 = st.columns(
@@ -1838,7 +2022,8 @@ if uploaded_file:
                     data=st.session_state.download_zip,
                     file_name=st.session_state.download_zip_name,
                     mime="application/zip",
-                    use_container_width=True
+                    use_container_width=True,
+                    key="download_clips_after_processing",
                 )
 
             with download_col2:
@@ -1849,12 +2034,12 @@ if uploaded_file:
                 )
 
             st.caption(
-                "The browser will download the ZIP "
-                "to your normal Downloads folder."
+                "The ZIP file will download to your "
+                "browser's normal Downloads folder."
             )
 
             # ------------------------------------------------
-            # GET/CREATE PENDING FOLDER
+            # ONEDRIVE FOLDER
             # ------------------------------------------------
 
             with st.spinner(
@@ -1885,7 +2070,9 @@ if uploaded_file:
                 total_clips=total_clips,
                 clip_duration=clip_duration,
                 aspect_ratio=aspect_ratio,
-                watermark_text=watermark_text
+                watermark_text=watermark_text,
+                episode_number=episode_number,
+                effect_preset=effect_preset,
             )
 
             metadata_path = os.path.join(
@@ -1904,7 +2091,7 @@ if uploaded_file:
                     metadata,
                     file,
                     indent=2,
-                    ensure_ascii=False
+                    ensure_ascii=False,
                 )
 
             # ------------------------------------------------
@@ -1936,6 +2123,12 @@ if uploaded_file:
                     clip
                 )
 
+                st.markdown(
+                    f"**🎞️ Uploading "
+                    f"{index}/{total_uploads}: "
+                    f"{clip_name}**"
+                )
+
                 clip_progress = st.progress(
                     0.0
                 )
@@ -1946,7 +2139,7 @@ if uploaded_file:
                     uploaded_bytes,
                     total_bytes,
                     current_index=index,
-                    current_name=clip_name
+                    current_name=clip_name,
                 ):
 
                     if total_bytes > 0:
@@ -1963,9 +2156,9 @@ if uploaded_file:
                     clip_percentage = min(
                         max(
                             clip_percentage,
-                            0
+                            0.0
                         ),
-                        1
+                        1.0
                     )
 
                     overall_percentage = (
@@ -1973,7 +2166,8 @@ if uploaded_file:
                             current_index - 1
                         ) +
                         clip_percentage
-                    ) / total_uploads
+                    ) /
+                    total_uploads
 
                     clip_progress.progress(
                         clip_percentage
@@ -1985,7 +2179,13 @@ if uploaded_file:
                     )
 
                     overall_upload_progress.progress(
-                        overall_percentage
+                        min(
+                            max(
+                                overall_percentage,
+                                0.0
+                            ),
+                            1.0
+                        )
                     )
 
                     upload_status.markdown(
@@ -1993,10 +2193,14 @@ if uploaded_file:
                         f"{overall_percentage * 100:.1f}%**"
                     )
 
+                    completed_count = (
+                        current_index - 1
+                    )
+
                     upload_count_status.write(
-                        f"📤 Uploaded: "
-                        f"{current_index - 1}/"
-                        f"{total_uploads} complete"
+                        f"📤 Completed: "
+                        f"{completed_count}/"
+                        f"{total_uploads}"
                     )
 
                 upload_file_to_onedrive(
@@ -2004,7 +2208,7 @@ if uploaded_file:
                     folder_id=folder_id,
                     file_path=clip,
                     file_name=clip_name,
-                    progress_callback=upload_progress_callback
+                    progress_callback=upload_progress_callback,
                 )
 
                 clip_progress.progress(
@@ -2026,13 +2230,13 @@ if uploaded_file:
                 )
 
                 upload_count_status.write(
-                    f"📤 Uploaded: "
+                    f"📤 Completed: "
                     f"{index}/"
-                    f"{total_uploads} complete"
+                    f"{total_uploads}"
                 )
 
             # ------------------------------------------------
-            # UPLOAD METADATA
+            # METADATA UPLOAD
             # ------------------------------------------------
 
             metadata_progress = st.progress(
@@ -2045,6 +2249,27 @@ if uploaded_file:
                 "**📄 Uploading metadata...**"
             )
 
+            def metadata_callback(
+                current,
+                total
+            ):
+
+                percentage = (
+                    current / total
+                    if total > 0
+                    else 0
+                )
+
+                metadata_progress.progress(
+                    min(
+                        max(
+                            percentage,
+                            0.0
+                        ),
+                        1.0
+                    )
+                )
+
             upload_file_to_onedrive(
                 token=token,
                 folder_id=folder_id,
@@ -2052,16 +2277,7 @@ if uploaded_file:
                 file_name=os.path.basename(
                     metadata_path
                 ),
-                progress_callback=lambda current, total: (
-                    metadata_progress.progress(
-                        min(
-                            current / total
-                            if total > 0
-                            else 0,
-                            1.0
-                        )
-                    )
-                )
+                progress_callback=metadata_callback,
             )
 
             metadata_progress.progress(
@@ -2073,7 +2289,7 @@ if uploaded_file:
             )
 
             # ------------------------------------------------
-            # FINAL SUCCESS
+            # FINAL
             # ------------------------------------------------
 
             overall_upload_progress.progress(
@@ -2085,8 +2301,8 @@ if uploaded_file:
             )
 
             upload_count_status.success(
-                f"✅ {total_uploads}/{total_uploads} "
-                f"clips uploaded successfully."
+                f"✅ {total_uploads}/"
+                f"{total_uploads} clips uploaded successfully."
             )
 
             st.success(
@@ -2099,33 +2315,11 @@ if uploaded_file:
                 "Facebook Auto Poster."
             )
 
-            # ------------------------------------------------
-            # FINAL LOCAL DOWNLOAD BUTTON
-            # ------------------------------------------------
-
-            st.divider()
-
-            st.subheader(
-                "💾 Download to Local Storage"
-            )
-
-            st.success(
-                "Your clips are also ready to download "
-                "to your computer."
-            )
-
-            st.download_button(
-                label=(
-                    "💾 Download All Clips "
-                    "to Local Storage"
-                ),
-                data=st.session_state.download_zip,
-                file_name=st.session_state.download_zip_name,
-                mime="application/zip",
-                use_container_width=True
-            )
-
             st.session_state.processing_complete = True
+
+            st.session_state.last_processed_video = (
+                uploaded_file.name
+            )
 
         except Exception as e:
 
@@ -2146,7 +2340,12 @@ if uploaded_file:
 
 
 # ============================================================
-# SHOW LOCAL DOWNLOAD AFTER RERUN
+# PERSISTENT LOCAL DOWNLOAD
+#
+# IMPORTANT:
+# This is the only persistent download button.
+# The duplicate-widget problem from the previous version
+# has been removed.
 # ============================================================
 
 if (
@@ -2160,26 +2359,29 @@ if (
         "💾 Local Download"
     )
 
+    st.success(
+        "Your generated clips are ready to download."
+    )
+
     st.download_button(
-        label=(
-            "💾 Download All Generated Clips"
-        ),
+        label="💾 Download All Generated Clips",
         data=st.session_state.download_zip,
         file_name=st.session_state.download_zip_name,
         mime="application/zip",
         use_container_width=True,
-        key="persistent_local_download"
+        key="persistent_local_download",
     )
 
     st.caption(
-        f"📦 {st.session_state.generated_total_clips} "
+        f"📦 "
+        f"{st.session_state.generated_total_clips} "
         f"clip(s) ready — "
         f"{st.session_state.download_zip_name}"
     )
 
 
 # ============================================================
-# FACEBOOK AUTO POSTER BUTTON
+# FACEBOOK AUTO POSTER
 # ============================================================
 
 st.divider()
@@ -2195,14 +2397,11 @@ st.info(
 )
 
 
-# ============================================================
-# FACEBOOK POST BUTTON
-# ============================================================
-
 run_poster = st.button(
     "▶️ Run Facebook Auto Poster",
     type="primary",
-    use_container_width=True
+    use_container_width=True,
+    key="run_facebook_poster",
 )
 
 
@@ -2230,7 +2429,7 @@ if run_poster:
 
         st.info(
             "GitHub Actions will now pick the next "
-            "pending video and post it to Facebook."
+            "pending video and process it."
         )
 
     except Exception as e:
@@ -2251,3 +2450,4 @@ st.caption(
     "🎬 Pro Video Studio | "
     "Streamlit + OneDrive + GitHub Actions"
 )
+```
