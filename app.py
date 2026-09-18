@@ -1,4 +1,3 @@
-```python
 import streamlit as st
 import requests
 import os
@@ -2450,4 +2449,3 @@ st.caption(
     "🎬 Pro Video Studio | "
     "Streamlit + OneDrive + GitHub Actions"
 )
-```
