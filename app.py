@@ -486,7 +486,7 @@ def get_video_duration(file_path):
 
 
 # ============================================================
-# SPLIT VIDEO
+# SPLIT VIDEO + EFFECTS + EPISODE/PART OVERLAY
 # ============================================================
 
 def split_video(
@@ -494,50 +494,252 @@ def split_video(
     output_dir,
     clip_duration,
     aspect_ratio,
-    watermark_text
+    watermark_text,
+    episode_number=1,
+    effect_preset="Trending",
+    enable_zoom=True,
+    enable_motion=True,
+    enable_fade=True,
+    enable_text=True
 ):
 
-    os.makedirs(
-        output_dir,
-        exist_ok=True
-    )
+    os.makedirs(output_dir, exist_ok=True)
 
-    duration = get_video_duration(
-        input_path
-    )
+    duration = get_video_duration(input_path)
 
     if duration <= 0:
-        raise Exception(
-            "Video duration is invalid."
-        )
+        raise Exception("Video duration is invalid.")
 
-    base_name = Path(
-        input_path
-    ).stem
+    base_name = Path(input_path).stem
+    original_file_name = Path(input_path).name
 
     output_files = []
 
     total_clips = int(
-        (duration + clip_duration - 1)
-        // clip_duration
+        (duration + clip_duration - 1) // clip_duration
     )
 
+    def escape_drawtext(text):
+        return (
+            str(text)
+            .replace("\\", "\\\\")
+            .replace(":", "\\:")
+            .replace("'", "\\'")
+            .replace("%", "\\%")
+            .replace(",", "\\,")
+            .replace("[", "\\[")
+            .replace("]", "\\]")
+        )
+
     # --------------------------------------------------------
-    # SPLIT EACH CLIP
+    # EFFECT PRESET
+    # --------------------------------------------------------
+
+    if effect_preset == "Clean":
+        zoom_amount = 0.0
+        motion_amount = 0.0
+
+    elif effect_preset == "Dynamic":
+        zoom_amount = 0.025
+        motion_amount = 2.0
+
+    elif effect_preset == "Cinematic":
+        zoom_amount = 0.018
+        motion_amount = 1.0
+
+    else:
+        # Trending
+        zoom_amount = 0.022
+        motion_amount = 1.5
+
+    # --------------------------------------------------------
+    # PROCESS EACH CLIP
     # --------------------------------------------------------
 
     for index in range(total_clips):
 
+        part_number = index + 1
         start_time = index * clip_duration
 
         output_name = (
-            f"{base_name}_clip_{index + 1:03d}.mp4"
+            f"{base_name}_clip_{part_number:03d}.mp4"
         )
 
         output_path = os.path.join(
             output_dir,
             output_name
         )
+
+        # ----------------------------------------------------
+        # EPISODE + PART TEXT
+        # ----------------------------------------------------
+
+        episode_text = (
+            f"EP {int(episode_number):02d} "
+            f"• PART {part_number:02d}/{total_clips}"
+        )
+
+        escaped_file_name = escape_drawtext(
+            original_file_name
+        )
+
+        escaped_episode_text = escape_drawtext(
+            episode_text
+        )
+
+        escaped_watermark = escape_drawtext(
+            watermark_text
+        )
+
+        filters = []
+
+        # ----------------------------------------------------
+        # ASPECT RATIO
+        # ----------------------------------------------------
+
+        if aspect_ratio == "9:16":
+            filters.append(
+                "crop=ih*9/16:ih"
+            )
+
+        elif aspect_ratio == "16:9":
+            filters.append(
+                "crop=iw:iw*9/16"
+            )
+
+        elif aspect_ratio == "1:1":
+            filters.append(
+                "crop=min(iw\\,ih):min(iw\\,ih)"
+            )
+
+        # ----------------------------------------------------
+        # SMOOTH ZOOM
+        # ----------------------------------------------------
+
+        if enable_zoom and zoom_amount > 0:
+
+            zoom_filter = (
+                "scale="
+                "iw*1.022:"
+                "ih*1.022,"
+                "crop=iw/1.022:"
+                "ih/1.022"
+            )
+
+            filters.append(zoom_filter)
+
+        # ----------------------------------------------------
+        # SUBTLE MOTION
+        # ----------------------------------------------------
+
+        if enable_motion and motion_amount > 0:
+
+            motion_filter = (
+                "crop="
+                "iw:"
+                "ih:"
+                f"x='{motion_amount}*sin(n/45)':"
+                "y=0"
+            )
+
+            filters.append(motion_filter)
+
+        # ----------------------------------------------------
+        # FADE IN / FADE OUT
+        # ----------------------------------------------------
+
+        if enable_fade:
+
+            fade_duration = 0.35
+
+            actual_clip_duration = min(
+                float(clip_duration),
+                float(duration - start_time)
+            )
+
+            fade_out_start = max(
+                actual_clip_duration - fade_duration,
+                0
+            )
+
+            filters.append(
+                f"fade=t=in:st=0:d={fade_duration}"
+            )
+
+            filters.append(
+                f"fade=t=out:st={fade_out_start}:d={fade_duration}"
+            )
+
+        # ----------------------------------------------------
+        # FILE NAME - TOP RIGHT
+        # ----------------------------------------------------
+
+        if enable_text:
+
+            filters.append(
+                (
+                    "drawtext="
+                    f"text='{escaped_file_name}':"
+                    "fontcolor=white:"
+                    "fontsize=28:"
+                    "x=w-tw-20:"
+                    "y=20:"
+                    "box=1:"
+                    "boxcolor=black@0.55:"
+                    "boxborderw=10"
+                )
+            )
+
+            # ------------------------------------------------
+            # EPISODE + PART - BOTTOM RIGHT
+            # ------------------------------------------------
+
+            filters.append(
+                (
+                    "drawtext="
+                    f"text='{escaped_episode_text}':"
+                    "fontcolor=white:"
+                    "fontsize=30:"
+                    "x=w-tw-20:"
+                    "y=h-th-20:"
+                    "box=1:"
+                    "boxcolor=black@0.60:"
+                    "boxborderw=10"
+                )
+            )
+
+        # ----------------------------------------------------
+        # WATERMARK
+        # ----------------------------------------------------
+
+        if watermark_text.strip():
+
+            filters.append(
+                (
+                    "drawtext="
+                    f"text='{escaped_watermark}':"
+                    "fontcolor=white:"
+                    "fontsize=28:"
+                    "x=20:"
+                    "y=h-th-20:"
+                    "box=1:"
+                    "boxcolor=black@0.50:"
+                    "boxborderw=8"
+                )
+            )
+
+        # ----------------------------------------------------
+        # BUILD VIDEO FILTER
+        # ----------------------------------------------------
+
+        if not filters:
+            video_filter = "null"
+        else:
+            video_filter = ",".join(filters)
+
+        # ----------------------------------------------------
+        # FFMPEG COMMAND
+        # ----------------------------------------------------
 
         command = [
             "ffmpeg",
@@ -547,74 +749,23 @@ def split_video(
             "-i",
             input_path,
             "-t",
-            str(clip_duration)
-        ]
-
-        # ----------------------------------------------------
-        # ASPECT RATIO
-        # ----------------------------------------------------
-
-        if aspect_ratio == "9:16":
-
-            command.extend([
-                "-vf",
-                "crop=ih*9/16:ih",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart"
-            ])
-
-        elif aspect_ratio == "16:9":
-
-            command.extend([
-                "-vf",
-                "crop=iw:iw*9/16",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart"
-            ])
-
-        elif aspect_ratio == "1:1":
-
-            command.extend([
-                "-vf",
-                "crop=min(iw\\,ih):min(iw\\,ih)",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
-                "-c:a",
-                "aac",
-                "-movflags",
-                "+faststart"
-            ])
-
-        else:
-
-            command.extend([
-                "-c",
-                "copy"
-            ])
-
-        command.append(
+            str(clip_duration),
+            "-vf",
+            video_filter,
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            "-movflags",
+            "+faststart",
             output_path
-        )
+        ]
 
         result = subprocess.run(
             command,
@@ -626,79 +777,11 @@ def split_video(
 
             raise Exception(
                 f"FFmpeg failed for clip "
-                f"{index + 1}: "
+                f"{part_number}: "
                 f"{result.stderr}"
             )
 
-        # ----------------------------------------------------
-        # WATERMARK
-        # ----------------------------------------------------
-
-        if watermark_text.strip():
-
-            watermarked_path = os.path.join(
-                output_dir,
-                f"wm_{output_name}"
-            )
-
-            escaped_text = (
-                watermark_text
-                .replace("\\", "\\\\")
-                .replace(":", "\\:")
-                .replace("'", "\\'")
-            )
-
-            watermark_command = [
-                "ffmpeg",
-                "-y",
-                "-i",
-                output_path,
-                "-vf",
-                (
-                    "drawtext="
-                    f"text='{escaped_text}':"
-                    "fontcolor=white:"
-                    "fontsize=28:"
-                    "x=20:"
-                    "y=h-th-20:"
-                    "box=1:"
-                    "boxcolor=black@0.5:"
-                    "boxborderw=8"
-                ),
-                "-c:v",
-                "libx264",
-                "-preset",
-                "medium",
-                "-crf",
-                "23",
-                "-c:a",
-                "copy",
-                "-movflags",
-                "+faststart",
-                watermarked_path
-            ]
-
-            watermark_result = subprocess.run(
-                watermark_command,
-                capture_output=True,
-                text=True
-            )
-
-            if watermark_result.returncode != 0:
-
-                raise Exception(
-                    "Watermark processing failed: "
-                    f"{watermark_result.stderr}"
-                )
-
-            os.replace(
-                watermarked_path,
-                output_path
-            )
-
-        output_files.append(
-            output_path
-        )
+        output_files.append(output_path)
 
     return output_files, total_clips
 
@@ -824,9 +907,14 @@ with st.sidebar:
     st.subheader("🎞️ Video Settings")
 
     # ========================================================
-    # CLIP DURATION
-    # 1200 SECONDS = 20 MINUTES
+    # VIDEO SETTINGS
     # ========================================================
+
+    st.subheader("🎞️ Video Settings")
+
+    # --------------------------------------------------------
+    # CLIP DURATION
+    # --------------------------------------------------------
 
     clip_duration = st.number_input(
         "Clip Duration (seconds)",
@@ -844,6 +932,27 @@ with st.sidebar:
         f"⏱️ Selected: {minutes} min {seconds} sec"
     )
 
+    # --------------------------------------------------------
+    # EPISODE NUMBER
+    # --------------------------------------------------------
+
+    episode_number = st.number_input(
+        "Episode Number",
+        min_value=1,
+        max_value=9999,
+        value=1,
+        step=1,
+        help="This number will appear inside every generated clip."
+    )
+
+    st.caption(
+        f"📺 Episode: EP {int(episode_number):02d}"
+    )
+
+    # --------------------------------------------------------
+    # ASPECT RATIO
+    # --------------------------------------------------------
+
     aspect_ratio = st.selectbox(
         "Aspect Ratio",
         [
@@ -855,9 +964,75 @@ with st.sidebar:
         index=0
     )
 
+    # --------------------------------------------------------
+    # EFFECT PRESET
+    # --------------------------------------------------------
+
+    effect_preset = st.selectbox(
+        "✨ Video Effect Preset",
+        [
+            "Trending",
+            "Clean",
+            "Dynamic",
+            "Cinematic"
+        ],
+        index=0,
+        help=(
+            "Trending uses subtle zoom, motion and fade "
+            "effects suitable for short-form videos."
+        )
+    )
+
+    # --------------------------------------------------------
+    # INDIVIDUAL EFFECTS
+    # --------------------------------------------------------
+
+    st.markdown("**✨ Effects**")
+
+    enable_zoom = st.checkbox(
+        "🔍 Smooth Zoom",
+        value=True
+    )
+
+    enable_motion = st.checkbox(
+        "🎥 Subtle Motion",
+        value=True
+    )
+
+    enable_fade = st.checkbox(
+        "🌊 Fade In / Out",
+        value=True
+    )
+
+    enable_text = st.checkbox(
+        "📝 Episode + Part Text",
+        value=True
+    )
+
+    # --------------------------------------------------------
+    # WATERMARK
+    # --------------------------------------------------------
+
     watermark_text = st.text_input(
         "Watermark Text",
-        value=""
+        value="",
+        placeholder="Example: @MyPage"
+    )
+
+    # --------------------------------------------------------
+    # PREVIEW INFORMATION
+    # --------------------------------------------------------
+
+    st.caption(
+        "📍 Top Right → Video File Name"
+    )
+
+    st.caption(
+        "📍 Bottom Right → EP XX • PART XX/XX"
+    )
+
+    st.caption(
+        "✨ Trending preset → Smooth Zoom + Motion + Fade"
     )
 
     st.divider()
@@ -1083,7 +1258,13 @@ if uploaded_file:
                     output_dir=output_dir,
                     clip_duration=clip_duration,
                     aspect_ratio=aspect_ratio,
-                    watermark_text=watermark_text
+                    watermark_text=watermark_text,
+                    episode_number=episode_number,
+                    effect_preset=effect_preset,
+                    enable_zoom=enable_zoom,
+                    enable_motion=enable_motion,
+                    enable_fade=enable_fade,
+                    enable_text=enable_text
                 )
 
             st.success(
