@@ -2163,10 +2163,8 @@ if uploaded_file:
                     overall_percentage = (
                         (
                             current_index - 1
-                        ) +
-                        clip_percentage
-                    ) /
-                    total_uploads
+                        ) + clip_percentage
+                    ) / total_uploads
 
                     clip_progress.progress(
                         clip_percentage
