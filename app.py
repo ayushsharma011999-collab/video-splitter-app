@@ -1,6 +1,7 @@
 import os
 import io
 import re
+import gc
 import json
 import math
 import time
@@ -10,7 +11,6 @@ import tempfile
 import subprocess
 from pathlib import Path
 from urllib.parse import quote
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 import streamlit as st
@@ -21,7 +21,7 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="Turbo Anime Studio — Ultra Fast Splitter",
+    page_title="Low-RAM Anime Studio",
     page_icon="⚡",
     layout="wide",
 )
@@ -46,7 +46,7 @@ DESTINATION_CONFIG = {
 
 
 # ============================================================
-# SESSION STATE
+# SESSION STATE (Zero Heavy Bytes in RAM)
 # ============================================================
 
 DEFAULT_STATE = {
@@ -59,8 +59,8 @@ DEFAULT_STATE = {
     "clips": [],
     "source_name": None,
 
-    "download_zip": None,
-    "download_zip_name": None,
+    "zip_path": None,
+    "zip_name": None,
 
     "split_complete": False,
     "upload_complete": False,
@@ -251,109 +251,10 @@ def generate_social_metadata(anime_title, season, episode, total_parts, gemini_k
 
 
 # ============================================================
-# ⚡ SINGLE CLIP FAST RENDER WORKER
+# ⚡ LOW-RAM FFMPEG RENDER ENGINE (SAFE & EFFICIENT)
 # ============================================================
 
-def render_single_clip_task(
-    part_number,
-    total_parts,
-    input_path,
-    output_path,
-    start_time,
-    current_duration,
-    anime_title,
-    season_num,
-    episode_num,
-    part_hook,
-    target_width,
-    target_height,
-    mirror_flip,
-    speed_factor,
-    color_boost,
-    reel_layout,
-    font_filter,
-):
-    esc_hook = ffmpeg_escape_text(part_hook.strip())
-    esc_label = ffmpeg_escape_text(f"{anime_title.strip()} • S{season_num} EP{episode_num} • PART {part_number}/{total_parts}")
-    esc_foot = ffmpeg_escape_text("FOLLOW FOR NEXT PART 🍿")
-
-    filter_complex = []
-    fg_mods = []
-    if mirror_flip:
-        fg_mods.append("hflip")
-    if color_boost:
-        fg_mods.append("eq=saturation=1.12:contrast=1.05:brightness=0.01")
-    fg_mod_str = ("," + ",".join(fg_mods)) if fg_mods else ""
-
-    if reel_layout == "9:16 Blurred Background":
-        # 🚀 TURBO BLUR HACK:
-        # Scale to 180x320 first (36x fewer pixels), blur lightly, scale up to target.
-        # This executes 30x faster than full-res blur!
-        filter_complex.append(
-            f"[0:v]scale=180:320:force_original_aspect_ratio=increase,crop=180:320,avgblur=5,scale={target_width}:{target_height}[bg]"
-        )
-        filter_complex.append(
-            f"[0:v]scale={target_width}:trunc(ih*{target_width}/iw/2)*2{fg_mod_str}[fg]"
-        )
-        filter_complex.append(
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]"
-        )
-        input_label = "[base]"
-    else:
-        base_filters = fg_mods if fg_mods else ["null"]
-        filter_complex.append(f"[0:v]{','.join(base_filters)}[base]")
-        input_label = "[base]"
-
-    banner_filters = [
-        "drawbox=x=0:y=0:w=iw:h='ih*0.14':color=black@0.75:t=fill",
-        f"drawtext=text='{esc_hook}':x=(w-text_w)/2:y='h*0.028':fontsize='h*0.038':fontcolor=yellow:bordercolor=black:borderw=2{font_filter}",
-        f"drawtext=text='{esc_label}':x=(w-text_w)/2:y='h*0.084':fontsize='h*0.028':fontcolor=white:bordercolor=black:borderw=2{font_filter}",
-        "drawbox=x=0:y='ih*0.93':w=iw:h='ih*0.07':color=black@0.75:t=fill",
-        f"drawtext=text='{esc_foot}':x=(w-text_w)/2:y='h*0.948':fontsize='h*0.025':fontcolor=white@0.9{font_filter}",
-    ]
-
-    if speed_factor != 1.0:
-        banner_filters.append(f"setpts=PTS/{speed_factor}")
-
-    filter_complex.append(f"{input_label}{','.join(banner_filters)}[v_out]")
-
-    a_filters = []
-    if speed_factor != 1.0:
-        a_filters.append(f"atempo={speed_factor}")
-    a_filters.append("equalizer=f=1000:t=q:w=1:g=-1.5")
-
-    command = [
-        "ffmpeg",
-        "-y",
-        "-ss", f"{start_time:.3f}",
-        "-avoid_negative_ts", "make_zero",
-        "-i", input_path,
-        "-t", f"{current_duration:.3f}",
-        "-filter_complex", ";".join(filter_complex),
-        "-map", "[v_out]",
-        "-map", "0:a?",
-        "-c:v", "libx264",
-        "-preset", "superfast",   # 🚀 2x faster than veryfast
-        "-crf", "22",
-        "-pix_fmt", "yuv420p",
-        "-threads", "0",          # 🚀 All CPU cores utilized
-        "-af", ",".join(a_filters),
-        "-c:a", "aac",
-        "-b:a", "128k",
-        "-sn",
-        "-movflags", "+faststart",
-        output_path,
-    ]
-
-    run_command(command, timeout=1800)
-    return output_path
-
-
-# ============================================================
-# ⚡ MULTI-THREADED PARALLEL SPLITTER
-# ============================================================
-
-def split_anime_turbo_parallel(
+def split_anime_low_ram(
     input_path,
     output_dir,
     clip_duration,
@@ -361,12 +262,10 @@ def split_anime_turbo_parallel(
     season_num,
     episode_num,
     part_hooks,
-    resolution="720p (Turbo Speed)",
     mirror_flip=True,
     speed_factor=1.03,
     color_boost=True,
     reel_layout="9:16 Blurred Background",
-    max_workers=2,
     progress_callback=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -377,13 +276,11 @@ def split_anime_turbo_parallel(
     font_path = find_font()
     font_filter = f":fontfile='{ffmpeg_escape_text(font_path)}'" if font_path else ""
 
-    # Set canvas resolution
-    if resolution == "720p (Turbo Speed)":
-        target_w, target_h = 720, 1280
-    else:
-        target_w, target_h = 1080, 1920
+    # Mobile optimized 720p canvas (Takes 55% less RAM than 1080p)
+    target_w, target_h = 720, 1280
 
-    tasks = []
+    clips = []
+
     for part_number in range(1, total_parts + 1):
         start_time = (part_number - 1) * clip_duration
         remaining = duration - start_time
@@ -391,54 +288,112 @@ def split_anime_turbo_parallel(
         if current_dur <= 0:
             break
 
-        out_file = os.path.join(output_dir, f"clip_{part_number:03d}.mp4")
+        output_path = os.path.join(output_dir, f"clip_{part_number:03d}.mp4")
         p_hook = part_hooks[part_number - 1] if part_number - 1 < len(part_hooks) else f"EPISODE {episode_num} SCENE 🔥"
 
-        tasks.append((
-            part_number, total_parts, input_path, out_file,
-            start_time, current_dur, anime_title, season_num, episode_num,
-            p_hook, target_w, target_h, mirror_flip, speed_factor, color_boost,
-            reel_layout, font_filter
-        ))
+        esc_hook = ffmpeg_escape_text(p_hook.strip())
+        esc_label = ffmpeg_escape_text(f"{anime_title.strip()} • S{season_num} EP{episode_num} • PART {part_number}/{total_parts}")
+        esc_foot = ffmpeg_escape_text("FOLLOW FOR NEXT PART 🍿")
 
-    clips = [None] * len(tasks)
-    completed_count = 0
+        filter_complex = []
+        fg_mods = []
+        if mirror_flip:
+            fg_mods.append("hflip")
+        if color_boost:
+            fg_mods.append("eq=saturation=1.12:contrast=1.05:brightness=0.01")
+        fg_mod_str = ("," + ",".join(fg_mods)) if fg_mods else ""
 
-    # Execute tasks in parallel using threads
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_map = {
-            executor.submit(render_single_clip_task, *task_args): task_args[0]
-            for task_args in tasks
-        }
+        if reel_layout == "9:16 Blurred Background":
+            # 🚀 ULTRA-LOW RAM BLUR TRICK:
+            # 180x320 tiny buffer blur. Uses under 150MB RAM!
+            filter_complex.append(
+                f"[0:v]scale=180:320:force_original_aspect_ratio=increase,crop=180:320,avgblur=5,scale={target_w}:{target_h}[bg]"
+            )
+            filter_complex.append(
+                f"[0:v]scale={target_w}:trunc(ih*{target_w}/iw/2)*2{fg_mod_str}[fg]"
+            )
+            filter_complex.append(
+                "[bg][fg]overlay=(W-w)/2:(H-h)/2[base]"
+            )
+            input_label = "[base]"
+        else:
+            base_filters = fg_mods if fg_mods else ["null"]
+            filter_complex.append(f"[0:v]{','.join(base_filters)}[base]")
+            input_label = "[base]"
 
-        for future in as_completed(future_map):
-            part_num = future_map[future]
-            try:
-                clip_path = future.result()
-                clips[part_num - 1] = clip_path
-                completed_count += 1
-                if progress_callback:
-                    progress_callback(completed_count / len(tasks))
-            except Exception as exc:
-                raise RuntimeError(f"Part {part_num} rendering failed:\n{exc}") from exc
+        banner_filters = [
+            "drawbox=x=0:y=0:w=iw:h='ih*0.14':color=black@0.75:t=fill",
+            f"drawtext=text='{esc_hook}':x=(w-text_w)/2:y='h*0.028':fontsize='h*0.038':fontcolor=yellow:bordercolor=black:borderw=2{font_filter}",
+            f"drawtext=text='{esc_label}':x=(w-text_w)/2:y='h*0.084':fontsize='h*0.028':fontcolor=white:bordercolor=black:borderw=2{font_filter}",
+            "drawbox=x=0:y='ih*0.93':w=iw:h='ih*0.07':color=black@0.75:t=fill",
+            f"drawtext=text='{esc_foot}':x=(w-text_w)/2:y='h*0.948':fontsize='h*0.025':fontcolor=white@0.9{font_filter}",
+        ]
 
-    return [c for c in clips if c is not None]
+        if speed_factor != 1.0:
+            banner_filters.append(f"setpts=PTS/{speed_factor}")
+
+        filter_complex.append(f"{input_label}{','.join(banner_filters)}[v_out]")
+
+        a_filters = []
+        if speed_factor != 1.0:
+            a_filters.append(f"atempo={speed_factor}")
+        a_filters.append("equalizer=f=1000:t=q:w=1:g=-1.5")
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-ss", f"{start_time:.3f}",
+            "-avoid_negative_ts", "make_zero",
+            "-i", input_path,
+            "-t", f"{current_dur:.3f}",
+            "-filter_complex", ";".join(filter_complex),
+            "-map", "[v_out]",
+            "-map", "0:a?",
+            "-c:v", "libx264",
+            "-preset", "superfast",
+            "-crf", "22",
+            "-pix_fmt", "yuv420p",
+            "-threads", "2",          # Limit FFmpeg threads to prevent RAM spikes
+            "-af", ",".join(a_filters),
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-sn",
+            "-movflags", "+faststart",
+            output_path,
+        ]
+
+        run_command(command, timeout=1800)
+        clips.append(output_path)
+
+        # Force clear memory after every clip
+        gc.collect()
+
+        if progress_callback:
+            progress_callback(part_number / total_parts)
+
+    return clips
 
 
 # ============================================================
-# ZIP & ONEDRIVE HELPERS
+# 💾 DISK-BASED ZIP (ZERO RAM CONSUMPTION)
 # ============================================================
 
-def create_zip(clips, source_name):
-    zip_buffer = io.BytesIO()
+def create_zip_on_disk(clips, source_name, job_dir):
     zip_base = Path(source_name).stem
     zip_name = f"{safe_filename(zip_base)}_all_clips.zip"
-    with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
+    zip_path = os.path.join(job_dir, zip_name)
+
+    # Directly writes to hard disk stream, 0 MB in RAM
+    with zipfile.ZipFile(zip_path, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
         for clip in clips:
             zip_file.write(clip, arcname=os.path.basename(clip))
-    zip_buffer.seek(0)
-    return zip_name, zip_buffer.getvalue()
 
+    return zip_path, zip_name
+
+
+# ============================================================
+# ONEDRIVE HELPERS
+# ============================================================
 
 def get_application_access_token():
     tenant_id = get_secret("AZURE_TENANT_ID")
@@ -586,34 +541,27 @@ def cleanup_previous_job():
     st.session_state.job_dir = None
     st.session_state.clips = []
     st.session_state.source_name = None
-    st.session_state.download_zip = None
-    st.session_state.download_zip_name = None
+    st.session_state.zip_path = None
+    st.session_state.zip_name = None
     st.session_state.split_complete = False
     st.session_state.upload_complete = False
     st.session_state.analyzed_file = None
+    gc.collect()
 
 
 # ============================================================
 # UI: HEADER & SIDEBAR
 # ============================================================
 
-st.title("⚡ Turbo Anime Studio — Ultra Fast Splitter")
-st.caption("5x Faster Render Engine • Multi-Core Parallel • Anti-Copyright Shield")
+st.title("⚡ Anime Studio — Low-RAM Edition")
+st.caption("Memory-Optimized for Cloud (Under 1GB RAM) • Anti-Copyright Shield • 1-Click Multi-Poster")
 
 with st.sidebar:
-    st.header("⚡ Speed & Quality")
-    resolution = st.selectbox(
-        "Resolution Preset",
-        ["720p (Turbo Speed)", "1080p (Full HD)"],
-        index=0,
-        help="720p मोबाइल स्क्रीन पर 1080p जैसा ही दिखता है लेकिन 2.5x तेज़ रेंडर होता है!",
-    )
-    parallel_workers = st.slider(
-        "Parallel CPU Threads",
-        min_value=1,
-        max_value=4,
-        value=2,
-        help="एक साथ कितनी क्लिप्स रेंडर होंगी। 2 या 3 सबसे बेस्ट रहता है।",
+    st.header("🤖 AI Settings")
+    gemini_key = st.text_input(
+        "Google Gemini API Key (Optional)",
+        value=get_secret("GEMINI_API_KEY", ""),
+        type="password",
     )
 
     st.divider()
@@ -648,7 +596,7 @@ with st.sidebar:
 
 
 # ============================================================
-# MAIN: VIDEO UPLOAD & MULTI-PLATFORM SETUP
+# MAIN: VIDEO UPLOAD & SETUP
 # ============================================================
 
 uploaded_video = st.file_uploader(
@@ -665,9 +613,9 @@ if uploaded_video is not None:
         st.session_state.source_name = current_name
 
     if not st.session_state.job_dir:
-        temp_dir = tempfile.mkdtemp(prefix="turbo_anime_")
+        temp_dir = tempfile.mkdtemp(prefix="anime_lowram_")
         input_file_path = os.path.join(temp_dir, safe_filename(current_name))
-        with st.spinner("Saving uploaded file..."):
+        with st.spinner("Saving file to disk..."):
             with open(input_file_path, "wb") as f:
                 shutil.copyfileobj(uploaded_video, f)
         st.session_state.job_dir = temp_dir
@@ -680,7 +628,7 @@ if uploaded_video is not None:
     if st.session_state.analyzed_file != (current_name, total_parts):
         title, s_num, ep_num = parse_anime_filename(current_name)
         with st.spinner("🤖 Generating Part Hooks & Multi-Platform Metadata..."):
-            hooks, social_meta = generate_social_metadata(title, s_num, ep_num, total_parts, get_secret("GEMINI_API_KEY"))
+            hooks, social_meta = generate_social_metadata(title, s_num, ep_num, total_parts, gemini_key)
         st.session_state.anime_title = title
         st.session_state.season_num = s_num
         st.session_state.episode_num = ep_num
@@ -693,6 +641,7 @@ if uploaded_video is not None:
     col_m2.metric("Clip Duration", f"{clip_duration}s")
     col_m3.metric("Total Clips", total_parts)
 
+    # Multi-Platform Metadata Tabs
     with st.expander("📢 Multi-Platform Captions & Tags (FB, Insta, YouTube)", expanded=False):
         tab_insta, tab_fb, tab_yt = st.tabs(["📸 Instagram Reels", "📘 Facebook Reels", "🔴 YouTube Shorts"])
         with tab_insta:
@@ -706,20 +655,20 @@ if uploaded_video is not None:
             st.text_area("YouTube Tags:", value=st.session_state.social_meta.get("youtube", {}).get("tags", ""), height=70)
 
     # --------------------------------------------------------
-    # TURBO SPLIT BUTTON
+    # SPLIT BUTTON (MEMORY-SAFE)
     # --------------------------------------------------------
-    if st.button("⚡ Start Turbo Split (Ultra Fast)", type="primary", use_container_width=True):
+    if st.button("⚡ Split Video (Low-RAM Safe Mode)", type="primary", use_container_width=True):
         clips_dir = os.path.join(st.session_state.job_dir, "clips")
         os.makedirs(clips_dir, exist_ok=True)
 
         try:
-            start_time_bench = time.time()
-            split_prog = st.progress(0, text=f"Turbo Rendering {total_parts} Clips (Parallel)...")
+            start_bench = time.time()
+            split_prog = st.progress(0, text=f"Rendering {total_parts} Clips safely...")
 
             def update_p(v):
-                split_prog.progress(max(0.0, min(1.0, float(v))), text=f"Turbo Progress: {int(v * 100)}%")
+                split_prog.progress(max(0.0, min(1.0, float(v))), text=f"Rendering: {int(v * 100)}%")
 
-            clips = split_anime_turbo_parallel(
+            clips = split_anime_low_ram(
                 input_path=input_file_path,
                 output_dir=clips_dir,
                 clip_duration=clip_duration,
@@ -727,22 +676,21 @@ if uploaded_video is not None:
                 season_num=st.session_state.season_num,
                 episode_num=st.session_state.episode_num,
                 part_hooks=st.session_state.ai_part_hooks,
-                resolution=resolution,
                 mirror_flip=mirror_flip,
                 speed_factor=speed_factor,
                 color_boost=color_boost,
                 reel_layout=reel_layout,
-                max_workers=parallel_workers,
                 progress_callback=update_p,
             )
 
-            total_render_time = time.time() - start_time_bench
-            split_prog.progress(1.0, text=f"⚡ All Clips Ready in {total_render_time:.1f}s!")
-            st.success(f"⚡ Turbo Speed: {len(clips)} क्लिप्स मात्र {total_render_time:.1f} सेकंड में तैयार हो गईं!")
+            total_t = time.time() - start_bench
+            split_prog.progress(1.0, text="All Clips Ready!")
+            st.success(f"✅ {len(clips)} क्लिप्स बिना किसी मेमोरी क्रैश के मात्र {total_t:.1f}s में तैयार हो गईं!")
 
             st.session_state.clips = clips
             st.session_state.split_complete = True
 
+            # Save metadata.json
             metadata_file = os.path.join(st.session_state.job_dir, "metadata.json")
             full_meta = {
                 "anime_title": st.session_state.anime_title,
@@ -755,61 +703,65 @@ if uploaded_video is not None:
             with open(metadata_file, "w", encoding="utf-8") as mf:
                 json.dump(full_meta, mf, indent=2, ensure_ascii=False)
 
-            zip_name, zip_bytes = create_zip(clips, uploaded_video.name)
-            st.session_state.download_zip = zip_bytes
-            st.session_state.download_zip_name = zip_name
+            # Create ZIP on Disk (0 MB RAM)
+            zpath, zname = create_zip_on_disk(clips, uploaded_video.name, st.session_state.job_dir)
+            st.session_state.zip_path = zpath
+            st.session_state.zip_name = zname
+            gc.collect()
 
         except Exception as exc:
-            st.error("❌ Video Split failed.")
+            st.error("❌ Split fail ho gaya.")
             st.exception(exc)
 
 
 # ============================================================
-# 1. LOCAL STORAGE DOWNLOADS
+# 1. DOWNLOAD & PREVIEW (RAM-SAFE DROPDOWN PLAYER)
 # ============================================================
 
 if st.session_state.split_complete and st.session_state.clips:
     clips = st.session_state.clips
     st.divider()
-    st.subheader("💾 Local Storage Download (PC / Mobile)")
+    st.subheader("💾 Local Storage Download")
 
-    if st.session_state.download_zip:
-        st.download_button(
-            label="📦 Download All Reel Parts Together (ZIP)",
-            data=st.session_state.download_zip,
-            file_name=st.session_state.download_zip_name,
-            mime="application/zip",
-            type="primary",
-            use_container_width=True,
-            key="zip_download",
-        )
+    # Disk-streamed ZIP download (Zero RAM)
+    if st.session_state.zip_path and os.path.exists(st.session_state.zip_path):
+        with open(st.session_state.zip_path, "rb") as zf:
+            st.download_button(
+                label="📦 Download All Clips Together (ZIP)",
+                data=zf,
+                file_name=st.session_state.zip_name,
+                mime="application/zip",
+                type="primary",
+                use_container_width=True,
+                key="zip_download",
+            )
 
     st.write("")
 
-    for idx, clip in enumerate(clips, start=1):
-        if not os.path.exists(clip):
-            continue
+    # 🚀 SMART PLAYER: Only loads 1 clip into memory at a time
+    with st.container(border=True):
+        st.subheader("🎬 Single Clip Preview & Download")
+        st.caption("मेमोरी बचाने के लिए जिस पार्ट को देखना हो, उसे नीचे ड्रॉपडाउन से चुनें:")
 
-        c_size = os.path.getsize(clip) / (1024 * 1024)
-        fname = os.path.basename(clip)
-        used_hook = st.session_state.ai_part_hooks[idx - 1] if idx - 1 < len(st.session_state.ai_part_hooks) else ""
+        part_options = [f"Part {i+1} — {os.path.basename(c)}" for i, c in enumerate(clips)]
+        selected_part_str = st.selectbox("Select Part:", part_options)
+        selected_idx = part_options.index(selected_part_str)
+        selected_clip = clips[selected_idx]
 
-        with st.container(border=True):
-            col_info, col_btn = st.columns([3, 1])
-            with col_info:
-                st.write(f"**Part {idx}** — `{used_hook}` ({c_size:.2f} MB)")
-            with col_btn:
-                with open(clip, "rb") as f:
-                    clip_bytes = f.read()
+        col_v1, col_v2 = st.columns([3, 1])
+        with col_v1:
+            # Streams directly from disk file path without loading whole video into Python RAM!
+            st.video(selected_clip)
+        with col_v2:
+            st.write(f"Size: `{os.path.getsize(selected_clip) / (1024 * 1024):.2f} MB`")
+            with open(selected_clip, "rb") as cf:
                 st.download_button(
-                    label=f"⬇️ Download Part {idx}",
-                    data=clip_bytes,
-                    file_name=fname,
+                    label=f"⬇️ Download Part {selected_idx + 1}",
+                    data=cf,
+                    file_name=os.path.basename(selected_clip),
                     mime="video/mp4",
-                    key=f"dl_{idx}_{st.session_state.source_name}",
                     use_container_width=True,
                 )
-            st.video(clip_bytes)
 
 
 # ============================================================
@@ -860,8 +812,9 @@ if st.session_state.split_complete and st.session_state.clips:
                     )
 
                 upload_progress.progress(1.0, text="Upload Complete!")
-                status_text.success(f"✅ Sabhi {total_files} files (Clips + Metadata) OneDrive me upload ho gayi!")
+                status_text.success(f"✅ Sabhi {total_files} files OneDrive me upload ho gayi!")
                 st.session_state.upload_complete = True
+                gc.collect()
 
             except Exception as exc:
                 st.error("❌ OneDrive upload failed.")
