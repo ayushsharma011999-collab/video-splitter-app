@@ -20,8 +20,8 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Video Studio & Multi-Hook Splitter",
-    page_icon="🎬",
+    page_title="Anime Studio — Multi-Platform Auto-Poster & Splitter",
+    page_icon="⚡",
     layout="wide",
 )
 
@@ -33,13 +33,13 @@ CHUNK_SIZE = 5 * 1024 * 1024
 DEFAULT_REPO = "ayushsharma011999-collab/video-splitter-app"
 
 DESTINATION_CONFIG = {
-    "Smart Deals India": {
-        "folder": "Pending_Posts",
-        "workflow": "main.yml",
-    },
     "Movies and web series": {
         "folder": "Movies_Pending_Posts",
         "workflow": "facebook-auto-poster-movies.yml",
+    },
+    "Smart Deals India": {
+        "folder": "Pending_Posts",
+        "workflow": "main.yml",
     },
 }
 
@@ -64,10 +64,13 @@ DEFAULT_STATE = {
     "split_complete": False,
     "upload_complete": False,
 
-    # AI Data
-    "ai_clean_title": "",
+    # Anime & Social Data
+    "anime_title": "",
+    "season_num": 1,
+    "episode_num": 1,
     "ai_part_hooks": [],
-    "ai_analyzed_for": None,  # (filename, total_parts)
+    "social_meta": {},
+    "analyzed_file": None,
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -76,7 +79,7 @@ for key, value in DEFAULT_STATE.items():
 
 
 # ============================================================
-# GENERAL HELPERS
+# GENERAL & FFMPEG HELPERS
 # ============================================================
 
 def get_secret(name, default=None):
@@ -94,22 +97,15 @@ def safe_filename(name):
     name = Path(name).name
     for char in '<>:"/\\|?*':
         name = name.replace(char, "_")
-    return name.strip().strip(".") or "video"
+    return name.strip().strip(".") or "anime_video"
 
 
 def ffmpeg_escape_text(text):
     text = str(text)
-    replacements = [
-        ("\\", r"\\"),
-        (":", r"\:"),
-        ("'", r"\'"),
-        ("%", r"\%"),
-        (",", r"\,"),
-        ("[", r"\["),
-        ("]", r"\]"),
-        (";", r"\;"),
-    ]
-    for old, new in replacements:
+    for old, new in [
+        ("\\", r"\\"), (":", r"\:"), ("'", r"\'"), ("%", r"\%"),
+        (",", r"\,"), ("[", r"\["), ("]", r"\]"), (";", r"\;"),
+    ]:
         text = text.replace(old, new)
     return text
 
@@ -124,16 +120,15 @@ def run_command(command, timeout=3600):
             timeout=timeout,
         )
     except FileNotFoundError as exc:
-        raise RuntimeError("FFmpeg/FFprobe PATH me nahi mila.") from exc
+        raise RuntimeError("FFmpeg PATH me nahi mila.") from exc
     except subprocess.TimeoutExpired as exc:
-        raise RuntimeError("FFmpeg process timeout ho gaya.") from exc
+        raise RuntimeError("FFmpeg process timed out.") from exc
 
     if result.returncode != 0:
         error_text = result.stderr.strip()
         if len(error_text) > 3000:
             error_text = error_text[-3000:]
         raise RuntimeError(error_text or "FFmpeg error.")
-
     return result
 
 
@@ -149,7 +144,7 @@ def get_video_duration(video_path):
     try:
         duration = float(result.stdout.strip())
     except ValueError as exc:
-        raise RuntimeError("Video duration read nahi ho payi.") from exc
+        raise RuntimeError("Duration detect nahi ho payi.") from exc
 
     if duration <= 0:
         raise RuntimeError("Invalid video duration.")
@@ -172,113 +167,129 @@ def find_font():
 
 
 # ============================================================
-# 🤖 AI MULTI-HOOK ENGINE (HAR PART KE LIYE ALAG HOOK)
+# 🎌 AI SOCIAL METADATA (FB, INSTA, YOUTUBE CAPTIONS & TAGS)
 # ============================================================
 
-def get_fallback_hooks(title, total_parts):
-    """अगर API Key न हो तो कहानी के हिसाब से अलग-अलग हुक तैयार करना"""
-    pool = [
-        "MASS ENTRY SCENE 🔥",
-        "WHEN THE TRUTH REVEALS 😱",
-        "UNEXPECTED TWIST HERE 💥",
-        "INTENSE CONFRONTATION ⚡",
-        "NOBODY EXPECTED THIS 🤯",
-        "THE MASTER PLAN UNVEILED 🎯",
-        "DANGEROUS FIGHT BEGINS ⚔️",
-        "DON'T MISS THIS SCENE 🍿",
-        "SUSPENSE AT ITS PEAK 👁️",
-        "HIGH VOLTAGE ACTION 💣",
-        "WHEN TABLES TURNED 🔄",
-        "EPIC CLIMAX SCENE 🏆",
-    ]
-    hooks = []
-    for i in range(total_parts):
-        if i == 0:
-            hooks.append("MASS ENTRY SCENE 🔥")
-        elif i == total_parts - 1:
-            hooks.append("EPIC CLIMAX SCENE 🏆")
-        else:
-            hooks.append(pool[(i - 1) % len(pool)])
-    return hooks
-
-
-def ai_generate_multi_part_hooks(filename, total_parts, gemini_api_key=None):
-    """Google Gemini AI से हर पार्ट के लिए अलग-अलग हुक जनरेट करना"""
+def parse_anime_filename(filename):
     base = Path(filename).stem
-    cleaned = re.sub(
-        r"(?i)\b(1080p|720p|480p|2160p|4k|web-?dl|bluray|hdrip|x264|x265|hevc|hindi|english|dual audio|aac|sub|esub)\b",
-        "",
-        base,
-    )
+    ep_match = re.search(r"(?i)(?:ep|e|episode|part)[._\s-]*(\d{1,3})|[-_\s](\d{1,3})(?=\s*[\(\[]|$)", base)
+    episode_num = int(ep_match.group(1) or ep_match.group(2)) if ep_match else 1
+
+    s_match = re.search(r"(?i)(?:s|season)[._\s-]*(\d{1,2})", base)
+    season_num = int(s_match.group(1)) if s_match else 1
+
+    cleaned = re.sub(r"\[.*?\]|\(.*?\)", "", base)
+    cleaned = re.sub(r"(?i)\b(1080p|720p|480p|2160p|4k|web-?dl|bluray|x264|x265|hevc|hindi|dual audio|sub|esub)\b", "", cleaned)
+    cleaned = re.sub(r"(?i)(?:s\d{1,2}|season\s*\d{1,2}|ep?\s*\d{1,3})", "", cleaned)
     cleaned = cleaned.replace(".", " ").replace("_", " ").replace("-", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
-    fallback_title = cleaned.title() if cleaned else "MOVIE CLIP"
 
-    if not gemini_api_key:
-        return fallback_title, get_fallback_hooks(fallback_title, total_parts)
+    title = cleaned.title() if cleaned else "Anime"
+    return title, season_num, episode_num
+
+
+def generate_social_metadata(anime_title, season, episode, total_parts, gemini_key=None):
+    """FB, Instagram और YouTube के लिए कैप्शंस, हैशटैग्स और कीवर्ड्स तैयार करना"""
+    
+    clean_tag = re.sub(r"[^a-zA-Z0-9]", "", anime_title)
+    
+    # स्मार्ट ऑफ़लाइन फॉलबैक डेटा
+    fallback_meta = {
+        "instagram": {
+            "caption": f"Wait for the end! 🔥 {anime_title} Season {season} Episode {episode} is on another level! 😱 Follow for all parts! 👇",
+            "hashtags": f"#{clean_tag} #AnimeReels #AnimeEdits #AnimeFight #AnimeLover #OtakuLife #AnimeHindi #ViralAnime #AnimeScenes #AnimeShorts #ReelsIndia #ExplorePage #AnimeFandom",
+        },
+        "facebook": {
+            "caption": f"What an intense moment in {anime_title} Season {season} Episode {episode}! 🔥 Watch till the end! Don't forget to Like and Share for Part 2! 🍿",
+            "hashtags": f"#{clean_tag} #Anime #AnimeLovers #ViralReels #ActionAnime #BestAnimeMoments #AnimeIndia",
+        },
+        "youtube": {
+            "title_template": f"{anime_title} S{season} EP{episode} Part {{part}} 🔥 #Shorts #Anime",
+            "description": f"{anime_title} Season {season} Episode {episode} best clips and moments.\nWatch all parts on our channel!\nSubscribe for daily anime shorts! 🍿",
+            "tags": f"{anime_title}, {anime_title} season {season}, {anime_title} episode {episode}, anime shorts, anime fight scene, hindi anime, best anime 2026, anime edits, anime reels",
+        }
+    }
+
+    fallback_hooks = [
+        "THE MONSTER AWAKENS ⚡",
+        "WHEN THE TRUTH REVEALS 😱",
+        "INSANE POWER UNLEASHED 🔥",
+        "UNEXPECTED TWIST HERE 💥",
+        "DANGEROUS FIGHT BEGINS ⚔️",
+        "DON'T MISS THIS MOMENT 🍿",
+        "NOBODY SAW THIS COMING 🤯",
+        "LEGENDARY SCENE AHEAD 🏆",
+    ]
+    hooks = [fallback_hooks[i % len(fallback_hooks)] for i in range(total_parts)]
+    hooks[0] = "THE FIGHT BEGINS 🔥"
+    hooks[-1] = "INSANE CLIMAX ENDING 🏆"
+
+    if not gemini_key:
+        return hooks, fallback_meta
 
     prompt = f"""
-    You are an expert viral movie/series clip editor for Facebook Reels.
-    Analyze this uploaded video filename: "{filename}"
-    Total clips to create: {total_parts}.
+    You are an expert social media manager for Anime on Facebook, Instagram, and YouTube.
+    Anime: "{anime_title}" Season {season} Episode {episode}. Total parts: {total_parts}.
 
-    Tasks:
-    1. Identify the official Movie or Web Series title.
-    2. Generate exactly {total_parts} UNIQUE, highly engaging viral hooks (one hook for each part, from Part 1 to Part {total_parts}).
-       - Each hook must be 3-5 words with 1 emoji (e.g. "MASS ENTRY SCENE 🔥", "WAIT FOR THE TWIST 😱", "CLIMAX FIGHT SCENE ⚔️").
-       - Maintain story progression (Part 1 = Entry/Setup, Middle Parts = Action/Suspense/Twists, Final Part = Climax/Ending).
+    Generate:
+    1. "hooks": List of exactly {total_parts} viral hook lines (3-5 words each with 1 emoji) for Part 1 to Part {total_parts}.
+    2. "instagram": Viral caption with high-ranking 15 hashtags.
+    3. "facebook": Engaging storytelling caption with 6-8 popular FB hashtags.
+    4. "youtube":
+       - "title_template": SEO title with #Shorts and emoji (under 60 chars), use {{part}} placeholder.
+       - "description": 3 line SEO description with CTA.
+       - "tags": Comma-separated high volume ranking search keywords/tags.
 
-    Return ONLY a raw JSON object (NO markdown backticks):
+    Return ONLY a valid JSON object matching this structure (no markdown):
     {{
-        "clean_title": "Official Title",
-        "hooks": [
-            "Part 1 Hook",
-            "Part 2 Hook"
-        ]
+        "hooks": ["Hook 1", "Hook 2"],
+        "instagram": {{"caption": "...", "hashtags": "..."}},
+        "facebook": {{"caption": "...", "hashtags": "..."}},
+        "youtube": {{"title_template": "...", "description": "...", "tags": "..."}}
     }}
     """
-
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_api_key}"
-
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={gemini_key}"
     try:
         res = requests.post(
             url,
-            json={
-                "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.4},
-            },
+            json={"contents": [{"parts": [{"text": prompt}]}], "generationConfig": {"temperature": 0.4}},
             timeout=18,
         )
         if res.status_code == 200:
             data = res.json()
-            raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            raw_text = re.sub(r"```json|```", "", raw_text).strip()
-            parsed = json.loads(raw_text)
-            title = parsed.get("clean_title", fallback_title)
-            hooks = parsed.get("hooks", [])
-
-            # Make sure we have exactly total_parts hooks
-            if len(hooks) < total_parts:
-                fallbacks = get_fallback_hooks(title, total_parts)
-                hooks.extend(fallbacks[len(hooks):])
-            return title, hooks[:total_parts]
+            txt = re.sub(r"```json|```", "", data["candidates"][0]["content"]["parts"][0]["text"]).strip()
+            parsed = json.loads(txt)
+            ai_hooks = parsed.get("hooks", [])
+            if len(ai_hooks) < total_parts:
+                ai_hooks.extend(hooks[len(ai_hooks):])
+            social_data = {
+                "instagram": parsed.get("instagram", fallback_meta["instagram"]),
+                "facebook": parsed.get("facebook", fallback_meta["facebook"]),
+                "youtube": parsed.get("youtube", fallback_meta["youtube"]),
+            }
+            return ai_hooks[:total_parts], social_data
     except Exception:
         pass
 
-    return fallback_title, get_fallback_hooks(fallback_title, total_parts)
+    return hooks, fallback_meta
 
 
 # ============================================================
-# 🎨 VIDEO SPLITTER (WITH UNIQUE HOOK ON EACH PART)
+# 🛡️ ANTI-COPYRIGHT VIDEO SPLITTER
 # ============================================================
 
-def split_video_with_unique_hooks(
+def split_anime_anti_copyright(
     input_path,
     output_dir,
     clip_duration,
-    clean_title,
+    anime_title,
+    season_num,
+    episode_num,
     part_hooks,
-    enable_frame=True,
+    mirror_flip=True,
+    speed_factor=1.03,
+    color_boost=True,
+    reel_layout="9:16 Blurred Background",
     progress_callback=None,
 ):
     os.makedirs(output_dir, exist_ok=True)
@@ -287,7 +298,7 @@ def split_video_with_unique_hooks(
     total_parts = max(1, math.ceil(duration / clip_duration))
 
     font_path = find_font()
-    font_filter_str = f":fontfile='{ffmpeg_escape_text(font_path)}'" if font_path else ""
+    font_filter = f":fontfile='{ffmpeg_escape_text(font_path)}'" if font_path else ""
 
     clips = []
 
@@ -301,52 +312,57 @@ def split_video_with_unique_hooks(
 
         output_path = os.path.join(output_dir, f"clip_{part_number:03d}.mp4")
 
-        # ----------------------------------------------------
-        # UNIQUE HOOK FOR THIS CURRENT PART
-        # ----------------------------------------------------
-        part_index = part_number - 1
-        current_hook = (
-            part_hooks[part_index]
-            if part_index < len(part_hooks)
-            else f"PART {part_number} SCENE 🔥"
+        part_hook = (
+            part_hooks[part_number - 1]
+            if part_number - 1 < len(part_hooks)
+            else f"EPISODE {episode_num} SCENE 🔥"
         )
 
-        v_filters = []
+        esc_hook = ffmpeg_escape_text(part_hook.strip())
+        esc_label = ffmpeg_escape_text(f"{anime_title.strip()} • S{season_num} EP{episode_num} • PART {part_number}/{total_parts}")
+        esc_foot = ffmpeg_escape_text("FOLLOW FOR NEXT PART 🍿")
 
-        if enable_frame:
-            # 1. Top Header Background
-            v_filters.append("drawbox=x=0:y=0:w=iw:h='ih*0.14':color=black@0.75:t=fill")
+        filter_complex = []
+        fg_mods = []
+        if mirror_flip:
+            fg_mods.append("hflip")
+        if color_boost:
+            fg_mods.append("eq=saturation=1.12:contrast=1.05:brightness=0.01")
 
-            # 2. Line 1: Unique Viral Hook for this specific part
-            esc_hook = ffmpeg_escape_text(current_hook.strip())
-            v_filters.append(
-                f"drawtext=text='{esc_hook}':x=(w-text_w)/2:y='h*0.025':"
-                f"fontsize='h*0.038':fontcolor=yellow:bordercolor=black:borderw=2{font_filter_str}"
-            )
+        fg_mod_str = ("," + ",".join(fg_mods)) if fg_mods else ""
 
-            # 3. Line 2: Movie Title + Dynamic Part Number
-            part_label = f"{clean_title.strip()}  •  PART {part_number}/{total_parts}"
-            esc_part = ffmpeg_escape_text(part_label)
-            v_filters.append(
-                f"drawtext=text='{esc_part}':x=(w-text_w)/2:y='h*0.082':"
-                f"fontsize='h*0.030':fontcolor=white:bordercolor=black:borderw=2{font_filter_str}"
-            )
+        if reel_layout == "9:16 Blurred Background":
+            filter_complex.append("[0:v]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,boxblur=20:5[bg]")
+            filter_complex.append(f"[0:v]scale=1080:trunc(ih*1080/iw/2)*2{fg_mod_str}[fg]")
+            filter_complex.append("[bg][fg]overlay=(W-w)/2:(H-h)/2[base]")
+            input_label = "[base]"
+        else:
+            base_filters = fg_mods if fg_mods else ["null"]
+            filter_complex.append(f"[0:v]{','.join(base_filters)}[base]")
+            input_label = "[base]"
 
-            # 4. Bottom Retention Bar
-            v_filters.append("drawbox=x=0:y='ih*0.93':w=iw:h='ih*0.07':color=black@0.75:t=fill")
-            esc_foot = ffmpeg_escape_text("FOLLOW FOR NEXT PART 🍿")
-            v_filters.append(
-                f"drawtext=text='{esc_foot}':x=(w-text_w)/2:y='h*0.948':"
-                f"fontsize='h*0.025':fontcolor=white@0.9{font_filter_str}"
-            )
+        banner_filters = [
+            "drawbox=x=0:y=0:w=iw:h='ih*0.14':color=black@0.75:t=fill",
+            f"drawtext=text='{esc_hook}':x=(w-text_w)/2:y='h*0.028':fontsize='h*0.038':fontcolor=yellow:bordercolor=black:borderw=2{font_filter}",
+            f"drawtext=text='{esc_label}':x=(w-text_w)/2:y='h*0.084':fontsize='h*0.028':fontcolor=white:bordercolor=black:borderw=2{font_filter}",
+            "drawbox=x=0:y='ih*0.93':w=iw:h='ih*0.07':color=black@0.75:t=fill",
+            f"drawtext=text='{esc_foot}':x=(w-text_w)/2:y='h*0.948':fontsize='h*0.025':fontcolor=white@0.9{font_filter}",
+        ]
 
-        # Smooth Audio & Video Fade
-        fade_dur = min(0.35, current_duration / 3)
-        fade_out_st = max(0, current_duration - fade_dur)
-        v_filters.append(f"fade=t=in:st=0:d={fade_dur:.2f}")
-        v_filters.append(f"fade=t=out:st={fade_out_st:.2f}:d={fade_dur:.2f}")
+        if speed_factor != 1.0:
+            banner_filters.append(f"setpts=PTS/{speed_factor}")
 
-        v_filters.append("pad='ceil(iw/2)*2':'ceil(ih/2)*2'")
+        filter_complex.append(f"{input_label}{','.join(banner_filters)}[v_out]")
+
+        a_filters = []
+        if speed_factor != 1.0:
+            a_filters.append(f"atempo={speed_factor}")
+        a_filters.append("equalizer=f=1000:t=q:w=1:g=-1.5")
+
+        fade_dur = min(0.35, (current_duration / speed_factor) / 3)
+        fade_out_st = max(0, (current_duration / speed_factor) - fade_dur)
+        a_filters.append(f"afade=t=in:st=0:d={fade_dur:.2f}")
+        a_filters.append(f"afade=t=out:st={fade_out_st:.2f}:d={fade_dur:.2f}")
 
         command = [
             "ffmpeg",
@@ -355,14 +371,14 @@ def split_video_with_unique_hooks(
             "-avoid_negative_ts", "make_zero",
             "-i", input_path,
             "-t", f"{current_duration:.3f}",
-            "-map", "0:v:0",
+            "-filter_complex", ";".join(filter_complex),
+            "-map", "[v_out]",
             "-map", "0:a?",
-            "-vf", ",".join(v_filters),
             "-c:v", "libx264",
             "-preset", "veryfast",
             "-crf", "22",
             "-pix_fmt", "yuv420p",
-            "-af", f"afade=t=in:st=0:d={fade_dur:.2f},afade=t=out:st={fade_out_st:.2f}:d={fade_dur:.2f}",
+            "-af", ",".join(a_filters),
             "-c:a", "aac",
             "-b:a", "128k",
             "-sn",
@@ -373,10 +389,10 @@ def split_video_with_unique_hooks(
         try:
             run_command(command, timeout=3600)
         except Exception as exc:
-            raise RuntimeError(f"Error creating PART {part_number}/{total_parts}:\n{exc}") from exc
+            raise RuntimeError(f"Part {part_number} fail:\n{exc}") from exc
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
-            raise RuntimeError(f"Part {part_number} generate nahi hua.")
+            raise RuntimeError(f"Part {part_number} fail ho gaya.")
 
         clips.append(output_path)
 
@@ -394,11 +410,9 @@ def create_zip(clips, source_name):
     zip_buffer = io.BytesIO()
     zip_base = Path(source_name).stem
     zip_name = f"{safe_filename(zip_base)}_all_clips.zip"
-
     with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED, compresslevel=1) as zip_file:
         for clip in clips:
             zip_file.write(clip, arcname=os.path.basename(clip))
-
     zip_buffer.seek(0)
     return zip_name, zip_buffer.getvalue()
 
@@ -407,10 +421,8 @@ def get_application_access_token():
     tenant_id = get_secret("AZURE_TENANT_ID")
     client_id = get_secret("AZURE_CLIENT_ID")
     client_secret = get_secret("AZURE_CLIENT_SECRET")
-
     if not tenant_id or not client_id or not client_secret:
         raise RuntimeError("Azure Secrets missing hain.")
-
     token_url = f"https://login.microsoftonline.com/{quote(tenant_id, safe='')}/oauth2/v2.0/token"
     res = requests.post(
         token_url,
@@ -423,12 +435,8 @@ def get_application_access_token():
         timeout=60,
     )
     if res.status_code != 200:
-        raise RuntimeError(f"Microsoft Token Error ({res.status_code})")
-
-    token = res.json().get("access_token")
-    if not token:
-        raise RuntimeError("Token receive nahi hua.")
-    return token
+        raise RuntimeError(f"Token Error ({res.status_code})")
+    return res.json().get("access_token")
 
 
 def graph_headers(token):
@@ -438,8 +446,6 @@ def graph_headers(token):
 def get_drive(token):
     url = f"{GRAPH_BASE_URL}/users/{quote(ONEDRIVE_USER, safe='')}/drive"
     res = requests.get(url, headers=graph_headers(token), timeout=60)
-    if res.status_code != 200:
-        raise RuntimeError(f"OneDrive Access Error ({res.status_code})")
     return res.json()
 
 
@@ -460,10 +466,8 @@ def create_folder(token, drive_id, folder_name):
     if res.status_code in (200, 201):
         return res.json()
     if res.status_code == 409:
-        existing = get_folder(token, drive_id, folder_name)
-        if existing:
-            return existing
-    raise RuntimeError(f"Folder create failed: {res.text[:500]}")
+        return get_folder(token, drive_id, folder_name)
+    raise RuntimeError(f"Folder create failed ({res.status_code})")
 
 
 def connect_onedrive(folder_name):
@@ -484,21 +488,18 @@ def upload_file_to_onedrive(token, drive_id, folder_id, file_path, progress_call
     filename = os.path.basename(file_path)
     total_size = os.path.getsize(file_path)
 
+    # Small file / JSON
     if total_size <= 4 * 1024 * 1024:
-        url = (
-            f"{GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}/items/"
-            f"{quote(folder_id, safe='')}:/{quote(filename, safe='')}:/content"
-        )
+        url = f"{GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}/items/{quote(folder_id, safe='')}:/{quote(filename, safe='')}:/content"
+        mime = "application/json" if filename.endswith(".json") else "video/mp4"
         with open(file_path, "rb") as fh:
-            requests.put(url, headers={**graph_headers(token), "Content-Type": "video/mp4"}, data=fh, timeout=300)
+            requests.put(url, headers={**graph_headers(token), "Content-Type": mime}, data=fh, timeout=300)
         if progress_callback:
             progress_callback(1.0)
         return
 
-    create_url = (
-        f"{GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}/items/"
-        f"{quote(folder_id, safe='')}:/{quote(filename, safe='')}:/createUploadSession"
-    )
+    # Large upload session
+    create_url = f"{GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}/items/{quote(folder_id, safe='')}:/{quote(filename, safe='')}:/createUploadSession"
     session_res = requests.post(
         create_url,
         headers={**graph_headers(token), "Content-Type": "application/json"},
@@ -520,10 +521,7 @@ def upload_file_to_onedrive(token, drive_id, folder_id, file_path, progress_call
                 try:
                     res = requests.put(
                         upload_url,
-                        headers={
-                            "Content-Length": str(len(chunk)),
-                            "Content-Range": f"bytes {start}-{end}/{total_size}",
-                        },
+                        headers={"Content-Length": str(len(chunk)), "Content-Range": f"bytes {start}-{end}/{total_size}"},
                         data=chunk,
                         timeout=300,
                     )
@@ -540,7 +538,6 @@ def upload_file_to_onedrive(token, drive_id, folder_id, file_path, progress_call
 def dispatch_github_workflow(workflow_file):
     github_token = get_secret("GITHUB_TOKEN")
     repo = get_secret("GITHUB_REPO", DEFAULT_REPO)
-
     if not github_token:
         raise RuntimeError("GITHUB_TOKEN secrets me nahi mila.")
 
@@ -572,15 +569,15 @@ def cleanup_previous_job():
     st.session_state.download_zip_name = None
     st.session_state.split_complete = False
     st.session_state.upload_complete = False
-    st.session_state.ai_analyzed_for = None
+    st.session_state.analyzed_file = None
 
 
 # ============================================================
 # UI: HEADER & SIDEBAR
 # ============================================================
 
-st.title("🎬 AI Video Studio & Multi-Hook Splitter")
-st.caption("Auto Storyline Hooks for Every Part • Local Download • OneDrive • GitHub Triggers")
+st.title("⚡ Anime Studio — Anti-Copyright & Multi-Platform Poster")
+st.caption("Auto Captions & Tags (FB, Insta, YouTube) • Anti-Copyright Shield • 1-Click Upload")
 
 with st.sidebar:
     st.header("🤖 AI Settings")
@@ -588,19 +585,26 @@ with st.sidebar:
         "Google Gemini API Key (Optional)",
         value=get_secret("GEMINI_API_KEY", ""),
         type="password",
-        help="API Key डालेंगे तो AI स्टोरी के अनुसार बेस्ट हुक जनरेट करेगा। नहीं तो स्मार्ट ऑफ़लाइन इंजन चलेगा।",
+        help="API Key se AI aur behtar viral captions & tags banata hai.",
     )
 
     st.divider()
 
-    st.header("⚙️ Split Settings")
-    clip_duration = st.number_input("Clip Duration (Seconds)", min_value=5, max_value=600, value=30, step=5)
-    enable_ai_frame = st.checkbox("🎨 Apply AI Viral Frame & Dynamic Parts", value=True)
+    st.header("🛡️ Anti-Copyright Shield")
+    speed_factor = st.selectbox("⚡ Micro Speed Hack", [1.03, 1.05, 1.0], index=0, help="Audio & Video timing shift to bypass bots.")
+    mirror_flip = st.checkbox("🪞 Mirror Mode (Horizontal Flip)", value=True)
+    color_boost = st.checkbox("🎨 Color Saturation & Contrast Boost", value=True)
+    reel_layout = st.selectbox("📱 Reel Format", ["9:16 Blurred Background", "Original Ratio"], index=0)
+
+    st.divider()
+
+    st.header("⚙️ Clip Length")
+    clip_duration = st.number_input("Clip Duration (Seconds)", min_value=15, max_value=180, value=60, step=5)
 
     st.divider()
 
     st.subheader("☁️ OneDrive Destination")
-    selected_dest_label = st.selectbox("Select Target", list(DESTINATION_CONFIG.keys()))
+    selected_dest_label = st.selectbox("Target Folder", list(DESTINATION_CONFIG.keys()))
     selected_dest_folder = DESTINATION_CONFIG[selected_dest_label]["folder"]
 
     if st.button("🔌 Connect OneDrive", use_container_width=True):
@@ -616,12 +620,12 @@ with st.sidebar:
 
 
 # ============================================================
-# MAIN: UPLOAD & MULTI-PART HOOK CONFIGURATION
+# MAIN: VIDEO UPLOAD & MULTI-PLATFORM SETUP
 # ============================================================
 
 uploaded_video = st.file_uploader(
-    "📤 Upload Video File",
-    type=["mp4", "mov", "mkv", "avi", "webm", "m4v"],
+    "📤 Upload Anime Episode (MKV / MP4 / MOV)",
+    type=["mp4", "mkv", "mov", "webm", "avi"],
 )
 
 if uploaded_video is not None:
@@ -632,86 +636,125 @@ if uploaded_video is not None:
         cleanup_previous_job()
         st.session_state.source_name = current_name
 
-    # Save temp file once to measure duration and compute total parts
     if not st.session_state.job_dir:
-        temp_dir = tempfile.mkdtemp(prefix="ai_video_split_")
+        temp_dir = tempfile.mkdtemp(prefix="anime_studio_")
         input_file_path = os.path.join(temp_dir, safe_filename(current_name))
-        with st.spinner("Reading video duration..."):
+        with st.spinner("Saving uploaded file..."):
             with open(input_file_path, "wb") as f:
                 shutil.copyfileobj(uploaded_video, f)
         st.session_state.job_dir = temp_dir
     else:
         input_file_path = os.path.join(st.session_state.job_dir, safe_filename(current_name))
 
-    video_duration = get_video_duration(input_file_path)
-    total_parts = max(1, math.ceil(video_duration / float(clip_duration)))
+    duration = get_video_duration(input_file_path)
+    total_parts = max(1, math.ceil(duration / float(clip_duration)))
+
+    # AI Auto Detection for Anime and Social Media Tags
+    if st.session_state.analyzed_file != (current_name, total_parts):
+        title, s_num, ep_num = parse_anime_filename(current_name)
+        with st.spinner("🤖 Generating Part Hooks, Social Captions & SEO Keywords..."):
+            hooks, social_meta = generate_social_metadata(title, s_num, ep_num, total_parts, gemini_key)
+        st.session_state.anime_title = title
+        st.session_state.season_num = s_num
+        st.session_state.episode_num = ep_num
+        st.session_state.ai_part_hooks = hooks
+        st.session_state.social_meta = social_meta
+        st.session_state.analyzed_file = (current_name, total_parts)
+
+    col_m1, col_m2, col_m3 = st.columns(3)
+    col_m1.metric("Video Length", f"{duration:.1f}s")
+    col_m2.metric("Clip Duration", f"{clip_duration}s")
+    col_m3.metric("Total Clips", total_parts)
 
     # --------------------------------------------------------
-    # AI MULTI-HOOK GENERATOR FOR ALL PARTS
+    # 📢 MULTI-PLATFORM CAPTIONS, HASHTAGS & KEYWORDS PREVIEW
     # --------------------------------------------------------
-    analysis_key = (current_name, total_parts)
-    if st.session_state.ai_analyzed_for != analysis_key:
-        with st.spinner(f"🤖 AI {total_parts} पार्ट्स के लिए अलग-अलग वायरल हुक जनरेट कर रहा है..."):
-            title, hooks = ai_generate_multi_part_hooks(current_name, total_parts, gemini_key)
-            st.session_state.ai_clean_title = title
-            st.session_state.ai_part_hooks = hooks
-            st.session_state.ai_analyzed_for = analysis_key
+    with st.expander("📢 View & Edit Multi-Platform Captions, Hashtags & Keywords", expanded=True):
+        tab_insta, tab_fb, tab_yt = st.tabs(["📸 Instagram Reels", "📘 Facebook Reels", "🔴 YouTube Shorts"])
+
+        with tab_insta:
+            insta_cap = st.text_area("Instagram Caption:", value=st.session_state.social_meta.get("instagram", {}).get("caption", ""), height=70)
+            insta_tags = st.text_area("Instagram Hashtags:", value=st.session_state.social_meta.get("instagram", {}).get("hashtags", ""), height=70)
+
+        with tab_fb:
+            fb_cap = st.text_area("Facebook Caption:", value=st.session_state.social_meta.get("facebook", {}).get("caption", ""), height=70)
+            fb_tags = st.text_area("Facebook Hashtags:", value=st.session_state.social_meta.get("facebook", {}).get("hashtags", ""), height=70)
+
+        with tab_yt:
+            yt_title = st.text_input("YouTube Shorts Title Template:", value=st.session_state.social_meta.get("youtube", {}).get("title_template", ""))
+            yt_desc = st.text_area("YouTube Description:", value=st.session_state.social_meta.get("youtube", {}).get("description", ""), height=70)
+            yt_tags = st.text_area("YouTube Backend Tags / Keywords:", value=st.session_state.social_meta.get("youtube", {}).get("tags", ""), height=70)
+
+        # Update metadata state
+        st.session_state.social_meta["instagram"] = {"caption": insta_cap, "hashtags": insta_tags}
+        st.session_state.social_meta["facebook"] = {"caption": fb_cap, "hashtags": fb_tags}
+        st.session_state.social_meta["youtube"] = {"title_template": yt_title, "description": yt_desc, "tags": yt_tags}
 
     # --------------------------------------------------------
-    # INTERACTIVE EDITABLE HOOKS UI
+    # PART HOOKS EDITOR
     # --------------------------------------------------------
-    col_m1, col_m2 = st.columns(2)
-    col_m1.metric("Video Length", f"{video_duration:.1f}s")
-    col_m2.metric("Total Clips To Generate", total_parts)
-
-    with st.container(border=True):
-        st.subheader("🎬 Movie / Web Series Name")
-        clean_title_input = st.text_input("Title (हर क्लिप पर दिखेगा):", value=st.session_state.ai_clean_title)
-
-        st.subheader("🔥 Hooks for Each Part (हर पार्ट का अपना अलग हुक)")
-        st.caption("AI ने हर पार्ट के लिए अलग हुक तय किया है। आप चाहें तो नीचे किसी भी पार्ट का हुक एडिट कर सकते हैं:")
+    with st.expander("🔥 Unique Hooks on Video Frames for Each Part", expanded=False):
+        c1, c2, c3 = st.columns([2, 1, 1])
+        with c1:
+            anime_title_input = st.text_input("Anime Title:", value=st.session_state.anime_title)
+        with c2:
+            season_input = st.number_input("Season:", min_value=1, max_value=20, value=st.session_state.season_num)
+        with c3:
+            episode_input = st.number_input("Episode:", min_value=1, max_value=100, value=st.session_state.episode_num)
 
         updated_hooks = []
-        # Display 2 columns for neat layout
-        c1, c2 = st.columns(2)
+        c_left, c_right = st.columns(2)
         for i in range(total_parts):
-            col = c1 if i % 2 == 0 else c2
-            current_val = (
-                st.session_state.ai_part_hooks[i]
-                if i < len(st.session_state.ai_part_hooks)
-                else f"PART {i+1} SCENE 🔥"
-            )
-            val = col.text_input(f"📍 Part {i+1} Hook:", value=current_val, key=f"hook_input_{i}")
+            col = c_left if i % 2 == 0 else c_right
+            current_val = st.session_state.ai_part_hooks[i] if i < len(st.session_state.ai_part_hooks) else "INSANE SCENE 🔥"
+            val = col.text_input(f"📍 Part {i+1} Hook:", value=current_val, key=f"anime_hook_{i}")
             updated_hooks.append(val)
-
         st.session_state.ai_part_hooks = updated_hooks
 
     # --------------------------------------------------------
-    # SPLIT EXECUTION BUTTON
+    # SPLIT EXECUTION
     # --------------------------------------------------------
-    if st.button("✂️ Split Video with Unique Hooks on Each Part", type="primary", use_container_width=True):
+    if st.button("⚡ Split Video with Anti-Copyright Shield", type="primary", use_container_width=True):
         clips_dir = os.path.join(st.session_state.job_dir, "clips")
         os.makedirs(clips_dir, exist_ok=True)
 
         try:
-            split_prog = st.progress(0, text="Generating clips with unique part hooks...")
+            split_prog = st.progress(0, text="Rendering Anime Clips...")
 
             def update_p(v):
                 split_prog.progress(max(0.0, min(1.0, float(v))), text=f"Rendering Parts: {int(v * 100)}%")
 
-            clips = split_video_with_unique_hooks(
+            clips = split_anime_anti_copyright(
                 input_path=input_file_path,
                 output_dir=clips_dir,
                 clip_duration=clip_duration,
-                clean_title=clean_title_input,
+                anime_title=anime_title_input,
+                season_num=season_input,
+                episode_num=episode_input,
                 part_hooks=st.session_state.ai_part_hooks,
-                enable_frame=enable_ai_frame,
+                mirror_flip=mirror_flip,
+                speed_factor=speed_factor,
+                color_boost=color_boost,
+                reel_layout=reel_layout,
                 progress_callback=update_p,
             )
 
-            split_prog.progress(1.0, text="All Unique-Hook Parts Generated!")
+            split_prog.progress(1.0, text="All Clips Ready!")
             st.session_state.clips = clips
             st.session_state.split_complete = True
+
+            # Save full metadata.json for Auto-Poster workflows
+            metadata_file = os.path.join(st.session_state.job_dir, "metadata.json")
+            full_meta = {
+                "anime_title": anime_title_input,
+                "season": season_input,
+                "episode": episode_input,
+                "total_parts": len(clips),
+                "part_hooks": st.session_state.ai_part_hooks,
+                "social": st.session_state.social_meta,
+            }
+            with open(metadata_file, "w", encoding="utf-8") as mf:
+                json.dump(full_meta, mf, indent=2, ensure_ascii=False)
 
             zip_name, zip_bytes = create_zip(clips, uploaded_video.name)
             st.session_state.download_zip = zip_bytes
@@ -733,7 +776,7 @@ if st.session_state.split_complete and st.session_state.clips:
 
     if st.session_state.download_zip:
         st.download_button(
-            label="📦 Download All Parts Together (ZIP)",
+            label="📦 Download All Reel Parts Together (ZIP)",
             data=st.session_state.download_zip,
             file_name=st.session_state.download_zip_name,
             mime="application/zip",
@@ -750,16 +793,12 @@ if st.session_state.split_complete and st.session_state.clips:
 
         c_size = os.path.getsize(clip) / (1024 * 1024)
         fname = os.path.basename(clip)
-        part_hook_used = (
-            st.session_state.ai_part_hooks[idx - 1]
-            if idx - 1 < len(st.session_state.ai_part_hooks)
-            else ""
-        )
+        used_hook = st.session_state.ai_part_hooks[idx - 1] if idx - 1 < len(st.session_state.ai_part_hooks) else ""
 
         with st.container(border=True):
             col_info, col_btn = st.columns([3, 1])
             with col_info:
-                st.write(f"**Part {idx}** — `{part_hook_used}` ({c_size:.2f} MB)")
+                st.write(f"**Part {idx}** — `{used_hook}` ({c_size:.2f} MB)")
             with col_btn:
                 with open(clip, "rb") as f:
                     clip_bytes = f.read()
@@ -775,7 +814,7 @@ if st.session_state.split_complete and st.session_state.clips:
 
 
 # ============================================================
-# 2. ONEDRIVE UPLOAD
+# 2. ONEDRIVE UPLOAD (CLIPS + METADATA.JSON)
 # ============================================================
 
 if st.session_state.split_complete and st.session_state.clips:
@@ -787,7 +826,7 @@ if st.session_state.split_complete and st.session_state.clips:
     if not st.session_state.onedrive_connected:
         st.warning("⚠️ Pehle sidebar se OneDrive connect karein.")
     else:
-        if st.button(f"☁️ Upload {len(st.session_state.clips)} Clips to OneDrive", use_container_width=True):
+        if st.button(f"☁️ Upload {len(st.session_state.clips)} Anime Clips + Metadata to OneDrive", use_container_width=True):
             upload_progress = st.progress(0, text="Uploading to OneDrive...")
             status_text = st.empty()
 
@@ -795,10 +834,16 @@ if st.session_state.split_complete and st.session_state.clips:
                 token = get_application_access_token()
                 drive_id = st.session_state.onedrive_drive_id
                 folder_id = st.session_state.onedrive_folder_id
-                total_files = len(st.session_state.clips)
 
-                for idx, clip in enumerate(st.session_state.clips, start=1):
-                    fname = os.path.basename(clip)
+                files_to_upload = list(st.session_state.clips)
+                meta_json_path = os.path.join(st.session_state.job_dir, "metadata.json")
+                if os.path.exists(meta_json_path):
+                    files_to_upload.append(meta_json_path)
+
+                total_files = len(files_to_upload)
+
+                for idx, fpath in enumerate(files_to_upload, start=1):
+                    fname = os.path.basename(fpath)
                     status_text.info(f"Uploading {fname} ({idx}/{total_files})...")
 
                     def make_cb(i=idx, tot=total_files):
@@ -811,12 +856,12 @@ if st.session_state.split_complete and st.session_state.clips:
                         token=token,
                         drive_id=drive_id,
                         folder_id=folder_id,
-                        file_path=clip,
+                        file_path=fpath,
                         progress_callback=make_cb(),
                     )
 
                 upload_progress.progress(1.0, text="Upload Complete!")
-                status_text.success(f"✅ Sabhi {total_files} clips successfully OneDrive me upload ho gayi!")
+                status_text.success(f"✅ Sabhi {total_files} files (Clips + Metadata) OneDrive me upload ho gayi!")
                 st.session_state.upload_complete = True
 
             except Exception as exc:
@@ -825,30 +870,30 @@ if st.session_state.split_complete and st.session_state.clips:
 
 
 # ============================================================
-# 3. GITHUB ACTIONS MANUAL TRIGGER (DONO BUTTONS)
+# 3. GITHUB ACTIONS MANUAL RUN (DONO BUTTONS)
 # ============================================================
 
 st.divider()
 st.subheader("🚀 GitHub Actions Manual Run")
-st.caption("OneDrive me clips jaane ke baad yahan se workflow manual trigger karein:")
+st.caption("OneDrive me clips jaane ke baad Facebook / Instagram auto poster trigger karein:")
 
 col_gh1, col_gh2 = st.columns(2)
 
 with col_gh1:
+    if st.button("🎬 Run Movies & Anime Workflow (facebook-auto-poster-movies.yml)", use_container_width=True):
+        try:
+            with st.spinner("Dispatching Movies & Anime workflow..."):
+                dispatch_github_workflow("facebook-auto-poster-movies.yml")
+            st.success("✅ Anime Auto-Poster (`facebook-auto-poster-movies.yml`) workflow trigger ho gaya!")
+        except Exception as exc:
+            st.error(f"❌ Dispatch failed: {exc}")
+
+with col_gh2:
     if st.button("🚀 Run Smart Deals India (main.yml)", use_container_width=True):
         try:
             with st.spinner("Dispatching Smart Deals India workflow..."):
                 dispatch_github_workflow("main.yml")
             st.success("✅ Smart Deals India (`main.yml`) workflow trigger ho gaya!")
-        except Exception as exc:
-            st.error(f"❌ Dispatch failed: {exc}")
-
-with col_gh2:
-    if st.button("🎬 Run Movies & Series (facebook-auto-poster-movies.yml)", use_container_width=True):
-        try:
-            with st.spinner("Dispatching Movies workflow..."):
-                dispatch_github_workflow("facebook-auto-poster-movies.yml")
-            st.success("✅ Movies & Series (`facebook-auto-poster-movies.yml`) workflow trigger ho gaya!")
         except Exception as exc:
             st.error(f"❌ Dispatch failed: {exc}")
 
@@ -859,6 +904,6 @@ with col_gh2:
 
 if st.session_state.split_complete and st.session_state.clips:
     st.divider()
-    if st.button("🗑️ Clear / New Video", use_container_width=True):
+    if st.button("🗑️ Clear / Next Episode", use_container_width=True):
         cleanup_previous_job()
         st.rerun()
