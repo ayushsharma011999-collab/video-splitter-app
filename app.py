@@ -20,7 +20,7 @@ import streamlit as st
 # ============================================================
 
 st.set_page_config(
-    page_title="AI Video Studio & Splitter",
+    page_title="AI Video Studio & Multi-Hook Splitter",
     page_icon="🎬",
     layout="wide",
 )
@@ -28,7 +28,7 @@ st.set_page_config(
 GRAPH_BASE_URL = "https://graph.microsoft.com/v1.0"
 GRAPH_SCOPE = "https://graph.microsoft.com/.default"
 ONEDRIVE_USER = "my@011999.onmicrosoft.com"
-CHUNK_SIZE = 5 * 1024 * 1024  # 5MB chunks
+CHUNK_SIZE = 5 * 1024 * 1024
 
 DEFAULT_REPO = "ayushsharma011999-collab/video-splitter-app"
 
@@ -64,10 +64,10 @@ DEFAULT_STATE = {
     "split_complete": False,
     "upload_complete": False,
 
-    # AI Frame Data
+    # AI Data
     "ai_clean_title": "",
-    "ai_hook": "",
-    "ai_analyzed": False,
+    "ai_part_hooks": [],
+    "ai_analyzed_for": None,  # (filename, total_parts)
 }
 
 for key, value in DEFAULT_STATE.items():
@@ -172,13 +172,39 @@ def find_font():
 
 
 # ============================================================
-# 🤖 AI ENGINE: TITLE SEARCH & FRAME HOOK GENERATOR
+# 🤖 AI MULTI-HOOK ENGINE (HAR PART KE LIYE ALAG HOOK)
 # ============================================================
 
-def smart_offline_cleaner(filename):
-    """अगर API Key न हो तो यह Regex से फ़ाइल का नाम साफ़ करता है"""
+def get_fallback_hooks(title, total_parts):
+    """अगर API Key न हो तो कहानी के हिसाब से अलग-अलग हुक तैयार करना"""
+    pool = [
+        "MASS ENTRY SCENE 🔥",
+        "WHEN THE TRUTH REVEALS 😱",
+        "UNEXPECTED TWIST HERE 💥",
+        "INTENSE CONFRONTATION ⚡",
+        "NOBODY EXPECTED THIS 🤯",
+        "THE MASTER PLAN UNVEILED 🎯",
+        "DANGEROUS FIGHT BEGINS ⚔️",
+        "DON'T MISS THIS SCENE 🍿",
+        "SUSPENSE AT ITS PEAK 👁️",
+        "HIGH VOLTAGE ACTION 💣",
+        "WHEN TABLES TURNED 🔄",
+        "EPIC CLIMAX SCENE 🏆",
+    ]
+    hooks = []
+    for i in range(total_parts):
+        if i == 0:
+            hooks.append("MASS ENTRY SCENE 🔥")
+        elif i == total_parts - 1:
+            hooks.append("EPIC CLIMAX SCENE 🏆")
+        else:
+            hooks.append(pool[(i - 1) % len(pool)])
+    return hooks
+
+
+def ai_generate_multi_part_hooks(filename, total_parts, gemini_api_key=None):
+    """Google Gemini AI से हर पार्ट के लिए अलग-अलग हुक जनरेट करना"""
     base = Path(filename).stem
-    # Remove release tags like 1080p, WEB-DL, x264, HDRip etc.
     cleaned = re.sub(
         r"(?i)\b(1080p|720p|480p|2160p|4k|web-?dl|bluray|hdrip|x264|x265|hevc|hindi|english|dual audio|aac|sub|esub)\b",
         "",
@@ -186,29 +212,29 @@ def smart_offline_cleaner(filename):
     )
     cleaned = cleaned.replace(".", " ").replace("_", " ").replace("-", " ")
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    fallback_title = cleaned.title() if cleaned else "MOVIE CLIP"
 
-    title = cleaned.title() if cleaned else "BLOCKBUSTER SCENE"
-    hook = "MUST WATCH SCENE 🔥"
-    return title, hook
-
-
-def ai_analyze_video_filename(filename, gemini_api_key=None):
-    """Google Gemini AI से फ़ाइल का नाम एनालाइज़ करके वायरल फ़्रेम तैयार करना"""
     if not gemini_api_key:
-        return smart_offline_cleaner(filename)
+        return fallback_title, get_fallback_hooks(fallback_title, total_parts)
 
     prompt = f"""
-    You are an expert viral movie clip editor for Facebook Reels.
+    You are an expert viral movie/series clip editor for Facebook Reels.
     Analyze this uploaded video filename: "{filename}"
+    Total clips to create: {total_parts}.
 
-    Task:
-    1. Identify the official Movie or Web Series title (and release year if applicable).
-    2. Create a super catchy, high-CTR viral hook line (maximum 4-5 words, in English or Hinglish with 1 emoji) that makes people stop scrolling. Example: "UNSTOPPABLE CLIMAX SCENE 🔥", "WAIT FOR THE TWIST 😱", "LEGENDARY ENTRY SCENE 💥".
+    Tasks:
+    1. Identify the official Movie or Web Series title.
+    2. Generate exactly {total_parts} UNIQUE, highly engaging viral hooks (one hook for each part, from Part 1 to Part {total_parts}).
+       - Each hook must be 3-5 words with 1 emoji (e.g. "MASS ENTRY SCENE 🔥", "WAIT FOR THE TWIST 😱", "CLIMAX FIGHT SCENE ⚔️").
+       - Maintain story progression (Part 1 = Entry/Setup, Middle Parts = Action/Suspense/Twists, Final Part = Climax/Ending).
 
-    Return ONLY a raw JSON object with NO extra text or markdown formatting:
+    Return ONLY a raw JSON object (NO markdown backticks):
     {{
-        "clean_title": "Official Title Here",
-        "viral_hook": "Viral Hook Line With Emoji"
+        "clean_title": "Official Title",
+        "hooks": [
+            "Part 1 Hook",
+            "Part 2 Hook"
+        ]
     }}
     """
 
@@ -219,34 +245,39 @@ def ai_analyze_video_filename(filename, gemini_api_key=None):
             url,
             json={
                 "contents": [{"parts": [{"text": prompt}]}],
-                "generationConfig": {"temperature": 0.3},
+                "generationConfig": {"temperature": 0.4},
             },
-            timeout=15,
+            timeout=18,
         )
         if res.status_code == 200:
             data = res.json()
             raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
-            # Clean JSON formatting backticks
             raw_text = re.sub(r"```json|```", "", raw_text).strip()
             parsed = json.loads(raw_text)
-            return parsed.get("clean_title", "MOVIE CLIP"), parsed.get("viral_hook", "CLIMAX SCENE 🔥")
+            title = parsed.get("clean_title", fallback_title)
+            hooks = parsed.get("hooks", [])
+
+            # Make sure we have exactly total_parts hooks
+            if len(hooks) < total_parts:
+                fallbacks = get_fallback_hooks(title, total_parts)
+                hooks.extend(fallbacks[len(hooks):])
+            return title, hooks[:total_parts]
     except Exception:
         pass
 
-    # Fallback to local cleaner if network/API drops
-    return smart_offline_cleaner(filename)
+    return fallback_title, get_fallback_hooks(fallback_title, total_parts)
 
 
 # ============================================================
-# 🎨 VIDEO SPLITTER + AI FRAME & DYNAMIC PART ENGINE
+# 🎨 VIDEO SPLITTER (WITH UNIQUE HOOK ON EACH PART)
 # ============================================================
 
-def split_video_with_ai_frame(
+def split_video_with_unique_hooks(
     input_path,
     output_dir,
     clip_duration,
     clean_title,
-    viral_hook,
+    part_hooks,
     enable_frame=True,
     progress_callback=None,
 ):
@@ -271,22 +302,29 @@ def split_video_with_ai_frame(
         output_path = os.path.join(output_dir, f"clip_{part_number:03d}.mp4")
 
         # ----------------------------------------------------
-        # AI FRAME & DYNAMIC PART FILTERS
+        # UNIQUE HOOK FOR THIS CURRENT PART
         # ----------------------------------------------------
+        part_index = part_number - 1
+        current_hook = (
+            part_hooks[part_index]
+            if part_index < len(part_hooks)
+            else f"PART {part_number} SCENE 🔥"
+        )
+
         v_filters = []
 
         if enable_frame:
-            # 1. Top Bar Background (Dark translucent header)
+            # 1. Top Header Background
             v_filters.append("drawbox=x=0:y=0:w=iw:h='ih*0.14':color=black@0.75:t=fill")
 
-            # 2. Line 1: AI Viral Hook (Top Center, Yellow, Eye-catching)
-            esc_hook = ffmpeg_escape_text(viral_hook.strip())
+            # 2. Line 1: Unique Viral Hook for this specific part
+            esc_hook = ffmpeg_escape_text(current_hook.strip())
             v_filters.append(
                 f"drawtext=text='{esc_hook}':x=(w-text_w)/2:y='h*0.025':"
                 f"fontsize='h*0.038':fontcolor=yellow:bordercolor=black:borderw=2{font_filter_str}"
             )
 
-            # 3. Line 2: Dynamic PART & Movie Title
+            # 3. Line 2: Movie Title + Dynamic Part Number
             part_label = f"{clean_title.strip()}  •  PART {part_number}/{total_parts}"
             esc_part = ffmpeg_escape_text(part_label)
             v_filters.append(
@@ -308,7 +346,6 @@ def split_video_with_ai_frame(
         v_filters.append(f"fade=t=in:st=0:d={fade_dur:.2f}")
         v_filters.append(f"fade=t=out:st={fade_out_st:.2f}:d={fade_dur:.2f}")
 
-        # Ensure Even Dimensions for H.264
         v_filters.append("pad='ceil(iw/2)*2':'ceil(ih/2)*2'")
 
         command = [
@@ -447,7 +484,6 @@ def upload_file_to_onedrive(token, drive_id, folder_id, file_path, progress_call
     filename = os.path.basename(file_path)
     total_size = os.path.getsize(file_path)
 
-    # Small file
     if total_size <= 4 * 1024 * 1024:
         url = (
             f"{GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}/items/"
@@ -459,7 +495,6 @@ def upload_file_to_onedrive(token, drive_id, folder_id, file_path, progress_call
             progress_callback(1.0)
         return
 
-    # Large upload session
     create_url = (
         f"{GRAPH_BASE_URL}/drives/{quote(drive_id, safe='')}/items/"
         f"{quote(folder_id, safe='')}:/{quote(filename, safe='')}:/createUploadSession"
@@ -537,15 +572,15 @@ def cleanup_previous_job():
     st.session_state.download_zip_name = None
     st.session_state.split_complete = False
     st.session_state.upload_complete = False
-    st.session_state.ai_analyzed = False
+    st.session_state.ai_analyzed_for = None
 
 
 # ============================================================
 # UI: HEADER & SIDEBAR
 # ============================================================
 
-st.title("🎬 AI Video Studio & Auto-Frame Splitter")
-st.caption("AI Title Detector • Dynamic Part Frames • Local Download • OneDrive • GitHub Triggers")
+st.title("🎬 AI Video Studio & Multi-Hook Splitter")
+st.caption("Auto Storyline Hooks for Every Part • Local Download • OneDrive • GitHub Triggers")
 
 with st.sidebar:
     st.header("🤖 AI Settings")
@@ -553,7 +588,7 @@ with st.sidebar:
         "Google Gemini API Key (Optional)",
         value=get_secret("GEMINI_API_KEY", ""),
         type="password",
-        help="अगर API Key नहीं है तो भी चिंता न करें, Smart Local Engine काम करेगा!",
+        help="API Key डालेंगे तो AI स्टोरी के अनुसार बेस्ट हुक जनरेट करेगा। नहीं तो स्मार्ट ऑफ़लाइन इंजन चलेगा।",
     )
 
     st.divider()
@@ -581,7 +616,7 @@ with st.sidebar:
 
 
 # ============================================================
-# MAIN: VIDEO UPLOAD & AI DETECTION
+# MAIN: UPLOAD & MULTI-PART HOOK CONFIGURATION
 # ============================================================
 
 uploaded_video = st.file_uploader(
@@ -597,67 +632,84 @@ if uploaded_video is not None:
         cleanup_previous_job()
         st.session_state.source_name = current_name
 
-    # --------------------------------------------------------
-    # AI Automatic Name & Hook Detection
-    # --------------------------------------------------------
-    if not st.session_state.ai_analyzed:
-        with st.spinner("🤖 AI फ़ाइल का नाम पढ़कर इंटरनेट से टाइटल और वायरल हुक तैयार कर रहा है..."):
-            clean_title, viral_hook = ai_analyze_video_filename(current_name, gemini_key)
-            st.session_state.ai_clean_title = clean_title
-            st.session_state.ai_hook = viral_hook
-            st.session_state.ai_analyzed = True
+    # Save temp file once to measure duration and compute total parts
+    if not st.session_state.job_dir:
+        temp_dir = tempfile.mkdtemp(prefix="ai_video_split_")
+        input_file_path = os.path.join(temp_dir, safe_filename(current_name))
+        with st.spinner("Reading video duration..."):
+            with open(input_file_path, "wb") as f:
+                shutil.copyfileobj(uploaded_video, f)
+        st.session_state.job_dir = temp_dir
+    else:
+        input_file_path = os.path.join(st.session_state.job_dir, safe_filename(current_name))
 
-    # Editable AI Preview Banner
+    video_duration = get_video_duration(input_file_path)
+    total_parts = max(1, math.ceil(video_duration / float(clip_duration)))
+
+    # --------------------------------------------------------
+    # AI MULTI-HOOK GENERATOR FOR ALL PARTS
+    # --------------------------------------------------------
+    analysis_key = (current_name, total_parts)
+    if st.session_state.ai_analyzed_for != analysis_key:
+        with st.spinner(f"🤖 AI {total_parts} पार्ट्स के लिए अलग-अलग वायरल हुक जनरेट कर रहा है..."):
+            title, hooks = ai_generate_multi_part_hooks(current_name, total_parts, gemini_key)
+            st.session_state.ai_clean_title = title
+            st.session_state.ai_part_hooks = hooks
+            st.session_state.ai_analyzed_for = analysis_key
+
+    # --------------------------------------------------------
+    # INTERACTIVE EDITABLE HOOKS UI
+    # --------------------------------------------------------
+    col_m1, col_m2 = st.columns(2)
+    col_m1.metric("Video Length", f"{video_duration:.1f}s")
+    col_m2.metric("Total Clips To Generate", total_parts)
+
     with st.container(border=True):
-        st.subheader("✨ AI Frame Preview (आप इसे बदल भी सकते हैं)")
-        col_t1, col_t2 = st.columns(2)
-        with col_t1:
-            clean_title_input = st.text_input("🎬 Movie / Series Name:", value=st.session_state.ai_clean_title)
-        with col_t2:
-            viral_hook_input = st.text_input("🔥 Viral Hook Line (Top Banner):", value=st.session_state.ai_hook)
+        st.subheader("🎬 Movie / Web Series Name")
+        clean_title_input = st.text_input("Title (हर क्लिप पर दिखेगा):", value=st.session_state.ai_clean_title)
 
-        st.caption(f"💡 Frame Format Example: **{viral_hook_input}** | **{clean_title_input} • PART 1/10**")
+        st.subheader("🔥 Hooks for Each Part (हर पार्ट का अपना अलग हुक)")
+        st.caption("AI ने हर पार्ट के लिए अलग हुक तय किया है। आप चाहें तो नीचे किसी भी पार्ट का हुक एडिट कर सकते हैं:")
+
+        updated_hooks = []
+        # Display 2 columns for neat layout
+        c1, c2 = st.columns(2)
+        for i in range(total_parts):
+            col = c1 if i % 2 == 0 else c2
+            current_val = (
+                st.session_state.ai_part_hooks[i]
+                if i < len(st.session_state.ai_part_hooks)
+                else f"PART {i+1} SCENE 🔥"
+            )
+            val = col.text_input(f"📍 Part {i+1} Hook:", value=current_val, key=f"hook_input_{i}")
+            updated_hooks.append(val)
+
+        st.session_state.ai_part_hooks = updated_hooks
 
     # --------------------------------------------------------
-    # SPLIT BUTTON
+    # SPLIT EXECUTION BUTTON
     # --------------------------------------------------------
-    if st.button("✂️ Split Video with AI Frame", type="primary", use_container_width=True):
-        job_dir = tempfile.mkdtemp(prefix="ai_video_split_")
-        input_filename = safe_filename(uploaded_video.name)
-        input_path = os.path.join(job_dir, input_filename)
-        clips_dir = os.path.join(job_dir, "clips")
+    if st.button("✂️ Split Video with Unique Hooks on Each Part", type="primary", use_container_width=True):
+        clips_dir = os.path.join(st.session_state.job_dir, "clips")
         os.makedirs(clips_dir, exist_ok=True)
 
-        st.session_state.job_dir = job_dir
-
         try:
-            with st.spinner("Saving video to disk..."):
-                with open(input_path, "wb") as f:
-                    shutil.copyfileobj(uploaded_video, f)
-
-            duration = get_video_duration(input_path)
-            total_parts = max(1, math.ceil(duration / float(clip_duration)))
-
-            col_m1, col_m2 = st.columns(2)
-            col_m1.metric("Video Length", f"{duration:.1f}s")
-            col_m2.metric("Total Clips", total_parts)
-
-            split_prog = st.progress(0, text="Generating clips with AI Frames...")
+            split_prog = st.progress(0, text="Generating clips with unique part hooks...")
 
             def update_p(v):
                 split_prog.progress(max(0.0, min(1.0, float(v))), text=f"Rendering Parts: {int(v * 100)}%")
 
-            clips = split_video_with_ai_frame(
-                input_path=input_path,
+            clips = split_video_with_unique_hooks(
+                input_path=input_file_path,
                 output_dir=clips_dir,
                 clip_duration=clip_duration,
                 clean_title=clean_title_input,
-                viral_hook=viral_hook_input,
+                part_hooks=st.session_state.ai_part_hooks,
                 enable_frame=enable_ai_frame,
                 progress_callback=update_p,
             )
 
-            split_prog.progress(1.0, text="All Parts Generated with AI Frames!")
+            split_prog.progress(1.0, text="All Unique-Hook Parts Generated!")
             st.session_state.clips = clips
             st.session_state.split_complete = True
 
@@ -681,7 +733,7 @@ if st.session_state.split_complete and st.session_state.clips:
 
     if st.session_state.download_zip:
         st.download_button(
-            label="📦 Download All Parts (ZIP)",
+            label="📦 Download All Parts Together (ZIP)",
             data=st.session_state.download_zip,
             file_name=st.session_state.download_zip_name,
             mime="application/zip",
@@ -698,11 +750,16 @@ if st.session_state.split_complete and st.session_state.clips:
 
         c_size = os.path.getsize(clip) / (1024 * 1024)
         fname = os.path.basename(clip)
+        part_hook_used = (
+            st.session_state.ai_part_hooks[idx - 1]
+            if idx - 1 < len(st.session_state.ai_part_hooks)
+            else ""
+        )
 
         with st.container(border=True):
             col_info, col_btn = st.columns([3, 1])
             with col_info:
-                st.write(f"**Part {idx}** — `{fname}` ({c_size:.2f} MB)")
+                st.write(f"**Part {idx}** — `{part_hook_used}` ({c_size:.2f} MB)")
             with col_btn:
                 with open(clip, "rb") as f:
                     clip_bytes = f.read()
