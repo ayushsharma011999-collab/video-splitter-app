@@ -273,4 +273,3 @@ class OneDriveStorage:
             json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
             "application/json; charset=utf-8",
         )
-}
