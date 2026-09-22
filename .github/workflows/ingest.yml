@@ -9,10 +9,8 @@ concurrency:
   group: autonomous-agent-1-ingest
   cancel-in-progress: false
 
-# Agent 1 only reads the repository. OneDrive is accessed with Azure/Graph secrets.
-# Keep the token permission at the minimum required level.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   ingest:
