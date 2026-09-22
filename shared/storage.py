@@ -10,7 +10,6 @@ import requests
 
 from shared.logger import logger
 
-
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
 
 
@@ -27,12 +26,10 @@ class OneDriveStorage:
 
         self.user = user
         self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {access_token}",
-                "Accept": "application/json",
-            }
-        )
+        self.session.headers.update({
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        })
         self.base_user = f"{GRAPH_BASE}/users/{self.user}/drive"
 
     def request(
@@ -47,8 +44,7 @@ class OneDriveStorage:
         if not url.startswith("http"):
             url = f"{self.base_user}{url}"
 
-        last_error: Exception | None = None
-
+        last_error = None
         for attempt in range(retries):
             try:
                 response = self.session.request(
@@ -61,7 +57,7 @@ class OneDriveStorage:
 
                 if response.status_code in {429, 500, 502, 503, 504}:
                     retry_after = response.headers.get("Retry-After")
-                    delay = float(retry_after) if retry_after else 2**attempt
+                    delay = float(retry_after) if retry_after else 2 ** attempt
                     logger.warning(
                         "Graph returned %s. Retrying in %.1fs...",
                         response.status_code,
@@ -85,12 +81,8 @@ class OneDriveStorage:
 
             except requests.RequestException as exc:
                 last_error = exc
-                delay = 2**attempt
-                logger.warning(
-                    "Network error: %s. Retrying in %.1fs...",
-                    exc,
-                    delay,
-                )
+                delay = 2 ** attempt
+                logger.warning("Network error: %s. Retrying in %.1fs...", exc, delay)
                 time.sleep(delay)
 
         raise GraphAPIError(
@@ -98,39 +90,48 @@ class OneDriveStorage:
         )
 
     def get_root(self) -> dict[str, Any]:
-        return self.request(
+        response = self.request(
             "GET",
             "/root?$select=id,name,folder,parentReference",
-        ).json()
+        )
+        try:
+            return response.json()
+        finally:
+            response.close()
 
     def get_item(self, item_id: str) -> dict[str, Any]:
-        return self.request(
+        response = self.request(
             "GET",
             f"/items/{item_id}?$select=id,name,size,createdDateTime,lastModifiedDateTime,parentReference,file,folder",
-        ).json()
+        )
+        try:
+            return response.json()
+        finally:
+            response.close()
 
     def list_children(self, parent_id: str) -> list[dict[str, Any]]:
         url = (
             f"{self.base_user}/items/{parent_id}/children"
             "?$select=id,name,size,createdDateTime,lastModifiedDateTime,parentReference,file,folder"
         )
-
-        results: list[dict[str, Any]] = []
+        results = []
 
         while url:
             response = self.request("GET", url)
-            payload = response.json()
-            response.close()
+            try:
+                payload = response.json()
+            finally:
+                response.close()
             results.extend(payload.get("value", []))
             url = payload.get("@odata.nextLink")
 
         return results
 
     def find_child(self, parent_id: str, name: str) -> dict[str, Any] | None:
-        return next(
-            (item for item in self.list_children(parent_id) if item.get("name") == name),
-            None,
-        )
+        for item in self.list_children(parent_id):
+            if item.get("name") == name:
+                return item
+        return None
 
     def create_folder(self, parent_id: str, name: str) -> dict[str, Any]:
         payload = {
@@ -138,11 +139,15 @@ class OneDriveStorage:
             "folder": {},
             "@microsoft.graph.conflictBehavior": "fail",
         }
-        return self.request(
+        response = self.request(
             "POST",
             f"/items/{parent_id}/children",
             json=payload,
-        ).json()
+        )
+        try:
+            return response.json()
+        finally:
+            response.close()
 
     def ensure_folder(self, parent_id: str, name: str) -> dict[str, Any]:
         existing = self.find_child(parent_id, name)
@@ -152,7 +157,6 @@ class OneDriveStorage:
                     f"OneDrive item '{name}' exists but is not a folder."
                 )
             return existing
-
         return self.create_folder(parent_id, name)
 
     def move_item(
@@ -161,17 +165,19 @@ class OneDriveStorage:
         new_parent_id: str,
         new_name: str | None = None,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "parentReference": {"id": new_parent_id},
-        }
+        payload = {"parentReference": {"id": new_parent_id}}
         if new_name:
             payload["name"] = new_name
 
-        return self.request(
+        response = self.request(
             "PATCH",
             f"/items/{item_id}",
             json=payload,
-        ).json()
+        )
+        try:
+            return response.json()
+        finally:
+            response.close()
 
     def download_file(
         self,
@@ -181,19 +187,13 @@ class OneDriveStorage:
         progress_callback: Callable[[float], None] | None = None,
     ) -> str:
         destination.parent.mkdir(parents=True, exist_ok=True)
-
         response = self.request(
             "GET",
             f"{self.base_user}/items/{item_id}/content",
             stream=True,
         )
 
-        total = (
-            int(response.headers.get("Content-Length", 0))
-            or expected_size
-            or 0
-        )
-
+        total = int(response.headers.get("Content-Length", 0)) or expected_size or 0
         downloaded = 0
         last_report = -1
         digest = hashlib.sha256()
@@ -217,10 +217,10 @@ class OneDriveStorage:
         finally:
             response.close()
 
-        if expected_size is not None and destination.stat().st_size != expected_size:
+        actual_size = destination.stat().st_size
+        if expected_size is not None and actual_size != expected_size:
             raise GraphAPIError(
-                "Downloaded file size mismatch: "
-                f"expected={expected_size}, actual={destination.stat().st_size}"
+                f"Downloaded file size mismatch: expected={expected_size}, actual={actual_size}"
             )
 
         if progress_callback:
@@ -228,22 +228,12 @@ class OneDriveStorage:
 
         return digest.hexdigest()
 
-    def download_bytes(self, item_id: str) -> bytes:
-        response = self.request(
-            "GET",
-            f"{self.base_user}/items/{item_id}/content",
-        )
-        try:
-            return response.content
-        finally:
-            response.close()
-
     def upload_bytes(
         self,
         parent_id: str,
         filename: str,
         content: bytes,
-        content_type: str = "text/plain",
+        content_type: str = "application/json",
     ) -> dict[str, Any]:
         response = self.request(
             "PUT",
@@ -262,15 +252,9 @@ class OneDriveStorage:
         filename: str,
         payload: dict[str, Any],
     ) -> dict[str, Any]:
-        content = json.dumps(
-            payload,
-            indent=2,
-            ensure_ascii=False,
-        ).encode("utf-8")
-
         return self.upload_bytes(
             parent_id,
             filename,
-            content,
+            json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
             "application/json; charset=utf-8",
         )
