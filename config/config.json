@@ -14,7 +14,7 @@
       ".webm",
       ".m4v"
     ],
-    "dispatch_agent_2": false
+    "dispatch_agent_2": true
   },
   "creative": {
     "model": "gpt-5.6-luna",
