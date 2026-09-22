@@ -225,7 +225,7 @@ def main() -> None:
     folder, claim, metadata, existing = found
     job_id = claim["job_id"]
     try:
-        creative = existing if existing else generate(metadata)
+        creative = validate(existing) if existing else generate(metadata)
         creative = dict(creative)
         creative.update({"agent": "agent_2_creative", "agent_version": "2.0.0", "job_id": job_id, "generated_at": creative.get("generated_at", utc_now()), "source_filename": metadata.get("original_filename"), "source_metadata_status": metadata.get("status")})
         storage.upload_json(folder["id"], "creative.json", creative)
