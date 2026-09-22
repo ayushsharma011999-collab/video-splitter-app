@@ -2,6 +2,10 @@ name: Agent 2 - Creative Director
 
 on:
   workflow_dispatch:
+  repository_dispatch:
+    types: [agent_1_ready]
+  schedule:
+    - cron: "*/5 * * * *"
 
 concurrency:
   group: autonomous-agent-2-creative
@@ -16,26 +20,41 @@ jobs:
     timeout-minutes: 20
 
     env:
-      AZURE_CLIENT_ID: \${{ secrets.AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: \${{ secrets.AZURE_TENANT_ID }}
-      AZURE_CLIENT_SECRET: \${{ secrets.AZURE_CLIENT_SECRET }}
-      ONEDRIVE_USER: \${{ secrets.ONEDRIVE_USER }}
-      OPENAI_API_KEY: \${{ secrets.OPENAI_API_KEY }}
+      PYTHONUNBUFFERED: "1"
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ONEDRIVE_USER: ${{ secrets.ONEDRIVE_USER }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      GITHUB_TOKEN: ${{ github.token }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Setup Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+          cache: "pip"
 
-      - name: Install Python dependencies
+      - name: Install Agent 2 dependency
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install requests
 
-      - name: Run Agent 2
+      - name: Preflight validation
+        shell: bash
         run: |
-          python agents/agent_2_creative/creative_director.py
+          test -n "$AZURE_CLIENT_ID" || { echo "Missing AZURE_CLIENT_ID secret"; exit 1; }
+          test -n "$AZURE_TENANT_ID" || { echo "Missing AZURE_TENANT_ID secret"; exit 1; }
+          test -n "$AZURE_CLIENT_SECRET" || { echo "Missing AZURE_CLIENT_SECRET secret"; exit 1; }
+          test -n "$ONEDRIVE_USER" || { echo "Missing ONEDRIVE_USER secret"; exit 1; }
+          test -n "$OPENAI_API_KEY" || { echo "Missing OPENAI_API_KEY secret"; exit 1; }
+          python -m json.tool config/config.json >/dev/null
+          python -m compileall -q agents/agent_2_creative shared
+          echo "Agent 2 preflight OK"
+
+      - name: Run Agent 2 - Creative Director
+        run: python agents/agent_2_creative/creative_director.py
