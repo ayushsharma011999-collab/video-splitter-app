@@ -132,6 +132,63 @@ def probe_video(video_path: Path) -> dict[str, Any]:
     }
 
 
+
+def find_recovery_job(
+    storage: OneDriveStorage,
+    processing_root_id: str,
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """
+    Find the oldest Agent 1 job that was claimed but never finished.
+    This allows the next scheduled GitHub Actions run to resume a job
+    after a runner/network interruption.
+    """
+    candidates: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
+
+    for folder in storage.list_children(processing_root_id):
+        if "folder" not in folder:
+            continue
+
+        claim_item = storage.find_child(folder["id"], "claim.json")
+        if not claim_item:
+            continue
+
+        try:
+            claim = json.loads(
+                storage.download_bytes(claim_item["id"]).decode("utf-8-sig")
+            )
+        except Exception as exc:
+            logger.warning(
+                "Skipping unreadable claim.json in %s: %s",
+                folder.get("name", "unknown"),
+                exc,
+            )
+            continue
+
+        if claim.get("agent") != "agent_1_ingest":
+            continue
+
+        if claim.get("status") != "INGESTING":
+            continue
+
+        candidates.append(
+            (
+                claim.get("claimed_at")
+                or folder.get("createdDateTime")
+                or "",
+                folder,
+                claim,
+            )
+        )
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[0])
+    _, folder, claim = candidates[0]
+    return folder, claim
+
+
+
 def get_oldest_episode(storage: OneDriveStorage, input_id: str) -> dict[str, Any] | None:
     candidates = []
 
@@ -323,6 +380,7 @@ def finalize_failure(
     )
 
 
+
 def main() -> None:
     logger.info("==========================================")
     logger.info("Agent 1 - INGEST SCOUT")
@@ -334,47 +392,150 @@ def main() -> None:
     root_id = storage.get_root()["id"]
     studio_root = storage.ensure_folder(root_id, ONEDRIVE_ROOT)
     input_root = storage.ensure_folder(studio_root["id"], INPUT_FOLDER)
-    processing_root = storage.ensure_folder(studio_root["id"], PROCESSING_FOLDER)
-    storage.ensure_folder(studio_root["id"], COMPLETED_FOLDER)
-    failed_root = storage.ensure_folder(studio_root["id"], FAILED_FOLDER)
+    processing_root = storage.ensure_folder(
+        studio_root["id"],
+        PROCESSING_FOLDER,
+    )
+    storage.ensure_folder(
+        studio_root["id"],
+        COMPLETED_FOLDER,
+    )
+    failed_root = storage.ensure_folder(
+        studio_root["id"],
+        FAILED_FOLDER,
+    )
 
     logger.info("OneDrive folders verified.")
 
-    episode = get_oldest_episode(storage, input_root["id"])
+    # -----------------------------------------------------
+    # 1) Recover an interrupted job before taking new work
+    # -----------------------------------------------------
+    recovery = find_recovery_job(
+        storage,
+        processing_root["id"],
+    )
+
+    if recovery:
+        job_folder, claim = recovery
+        job_id = claim["job_id"]
+
+        logger.info(
+            "Interrupted job found. Resuming: %s",
+            job_id,
+        )
+
+        try:
+            metadata = process_job(
+                storage,
+                job_folder,
+                claim,
+            )
+            dispatch_agent_2(metadata)
+
+            logger.info("Recovered job completed: %s", job_id)
+            return
+
+        except Exception as exc:
+            logger.exception(
+                "Recovery failed for %s",
+                job_id,
+            )
+
+            try:
+                finalize_failure(
+                    storage,
+                    job_folder,
+                    failed_root,
+                    claim,
+                    exc,
+                )
+            except Exception as final_error:
+                logger.error(
+                    "Could not finalize recovered failure: %s",
+                    final_error,
+                )
+
+            raise
+
+    # -----------------------------------------------------
+    # 2) No interrupted job: take the next Input episode
+    # -----------------------------------------------------
+    episode = get_oldest_episode(
+        storage,
+        input_root["id"],
+    )
+
     if not episode:
-        logger.info("Input queue is empty. Nothing to ingest.")
+        logger.info(
+            "Input queue is empty. Nothing to ingest."
+        )
         return
 
     original_name = episode["name"]
-    job_id = create_job_id(original_name, episode["id"])
+    source_item_id = episode["id"]
 
-    logger.info("Selected episode: %s", original_name)
-    logger.info("Job ID: %s", job_id)
+    # The source item ID is part of job_id, which means the same
+    # OneDrive item cannot accidentally create a second job ID.
+    job_id = create_job_id(
+        original_name,
+        source_item_id,
+    )
 
-    job_folder = storage.ensure_folder(processing_root["id"], job_id)
+    logger.info(
+        "Selected episode: %s",
+        original_name,
+    )
+    logger.info(
+        "Job ID: %s",
+        job_id,
+    )
+
+    job_folder = storage.ensure_folder(
+        processing_root["id"],
+        job_id,
+    )
 
     claim = {
         "agent": "agent_1_ingest",
+        "agent_version": "1.1.0",
         "status": "INGESTING",
         "job_id": job_id,
         "claimed_at": utc_now(),
-        "source_item_id": episode["id"],
+        "source_item_id": source_item_id,
         "original_filename": original_name,
         "input_folder": INPUT_FOLDER,
         "processing_folder": PROCESSING_FOLDER,
     }
 
     try:
-        storage.upload_json(job_folder["id"], "claim.json", claim)
-        metadata = process_job(storage, job_folder, claim)
+        # Claim is written before moving the source. If the runner
+        # stops after this point, the next run can identify the job.
+        storage.upload_json(
+            job_folder["id"],
+            "claim.json",
+            claim,
+        )
+
+        metadata = process_job(
+            storage,
+            job_folder,
+            claim,
+        )
+
         dispatch_agent_2(metadata)
 
+        logger.info("==========================================")
         logger.info("AGENT 1 SUCCESS")
         logger.info("Episode: %s", original_name)
         logger.info("Job: %s", job_id)
+        logger.info("==========================================")
 
     except Exception as exc:
-        logger.exception("Agent 1 failed for %s", job_id)
+        logger.exception(
+            "Agent 1 failed for %s",
+            job_id,
+        )
+
         try:
             finalize_failure(
                 storage,
@@ -384,9 +545,12 @@ def main() -> None:
                 exc,
             )
         except Exception as final_error:
-            logger.error("Failed to finalize Failed/ job: %s", final_error)
-        raise
+            logger.error(
+                "Could not finalize failed job: %s",
+                final_error,
+            )
 
+        raise
 
 if __name__ == "__main__":
     main()
