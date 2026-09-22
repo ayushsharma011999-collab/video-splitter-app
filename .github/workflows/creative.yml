@@ -1,0 +1,41 @@
+name: Agent 2 - Creative Director
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: autonomous-agent-2-creative
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  creative:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      AZURE_CLIENT_ID: \${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: \${{ secrets.AZURE_TENANT_ID }}
+      AZURE_CLIENT_SECRET: \${{ secrets.AZURE_CLIENT_SECRET }}
+      ONEDRIVE_USER: \${{ secrets.ONEDRIVE_USER }}
+      OPENAI_API_KEY: \${{ secrets.OPENAI_API_KEY }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Agent 2
+        run: |
+          python agents/agent_2_creative/creative_director.py
