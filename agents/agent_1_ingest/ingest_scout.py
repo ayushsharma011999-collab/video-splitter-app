@@ -281,7 +281,7 @@ def process_job(
 
     metadata = {
         "agent": "agent_1_ingest",
-        "agent_version": "1.0.0",
+        "agent_version": "1.1.0",
         "job_id": claim["job_id"],
         "status": "READY_FOR_CREATIVE",
         "source": "onedrive",
