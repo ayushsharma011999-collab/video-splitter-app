@@ -109,6 +109,21 @@ class OneDriveStorage:
         finally:
             response.close()
 
+    def download_bytes(self, item_id: str) -> bytes:
+        """Download a small OneDrive file directly into memory.
+
+        This is intended for small control/metadata files such as claim.json
+        and metadata.json, not large video files.
+        """
+        response = self.request(
+            "GET",
+            f"{self.base_user}/items/{item_id}/content",
+        )
+        try:
+            return response.content
+        finally:
+            response.close()
+
     def list_children(self, parent_id: str) -> list[dict[str, Any]]:
         url = (
             f"{self.base_user}/items/{parent_id}/children"
@@ -258,3 +273,4 @@ class OneDriveStorage:
             json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8"),
             "application/json; charset=utf-8",
         )
+}
